@@ -1,0 +1,33 @@
+name: Build Watch APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kodu Cek
+        uses: actions/checkout@v4
+
+      - name: Java 17 Kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Gradle Kur
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Debug APK Olustur
+        run: gradle assembleDebug --stacktrace
+
+      - name: APK Dosyasini Yukle
+        uses: actions/upload-artifact@v4
+        with:
+          name: WatchDrift-APK
+          path: build/outputs/apk/debug/WatchDrift-debug.apk
