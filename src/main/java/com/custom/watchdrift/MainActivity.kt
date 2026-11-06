@@ -1,24 +1,84 @@
 package com.custom.watchdrift
 
+import android.Manifest
 import android.app.Activity
+import android.bluetooth.*
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.*
 import android.os.*
 import android.view.*
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.util.UUID
+import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.concurrent.thread
 import kotlin.math.*
+import kotlin.random.Random
 
 class MainActivity : Activity() {
+    private lateinit var gameView: CrownDriftView
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        val view = CrownDriftView(this)
-        setContentView(view)
-        view.requestFocus()
+        gameView = CrownDriftView(this)
+        setContentView(gameView)
+        gameView.requestFocus()
+        requestBtPermissionsIfNeeded()
+    }
+
+    private fun requestBtPermissionsIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val perms = arrayOf(
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_ADVERTISE
+            )
+            val missing = perms.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+            if (missing.isNotEmpty()) {
+                requestPermissions(missing.toTypedArray(), 101)
+            }
+        }
+    }
+
+    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        if (ev.action == MotionEvent.ACTION_SCROLL) {
+            if (gameView.handleRotaryScroll(ev)) return true
+        }
+        return super.dispatchGenericMotionEvent(ev)
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_STEM_1) {
+            if (gameView.onSideButtonPressed()) return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (!gameView.onSideButtonPressed()) super.onBackPressed()
+    }
+
+    override fun onDestroy() {
+        gameView.stopAllBluetooth()
+        super.onDestroy()
     }
 }
 
 data class Vec2(val x: Float, val y: Float)
-data class GhostPose(val x: Float, val y: Float, val yaw: Float)
+data class GhostPose(val x: Float, val y: Float, val yaw: Float, val roll: Float)
+
+data class RemotePlayer(
+    var active: Boolean = false,
+    var name: String = "Bos",
+    var x: Float = 0f,
+    var y: Float = 0f,
+    var yaw: Float = 0f,
+    var roll: Float = 0f,
+    var colorIdx: Int = 7
+)
 
 data class BotCar(
     var wpFloat: Float,
@@ -28,8 +88,33 @@ data class BotCar(
     val color: Int,
     var x: Float = 0f,
     var y: Float = 0f,
-    var yaw: Float = 0f
+    var yaw: Float = 0f,
+    var vx: Float = 0f,
+    var vy: Float = 0f
 )
+
+data class Obstacle3D(val x: Float, val y: Float, val radius: Float, val height: Float, val isTree: Boolean)
+
+class DebrisPart {
+    var active = false
+    var x = 0f; var y = 0f; var z = 0f
+    var vx = 0f; var vy = 0f; var vz = 0f
+    var yaw = 0f; var size = 3f; var color = 0; var life = 0f
+}
+
+class Particle3D {
+    var active = false
+    var x = 0f; var y = 0f; var z = 0f
+    var vx = 0f; var vy = 0f; var vz = 0f
+    var size = 3f; var alpha = 0; var color = 0
+}
+
+class TireMark {
+    var active = false
+    var lx1 = 0f; var ly1 = 0f; var lx2 = 0f; var ly2 = 0f
+    var rx1 = 0f; var ry1 = 0f; var rx2 = 0f; var ry2 = 0f
+    var color = 0
+}
 
 data class TrackData(
     val name: String,
@@ -39,15 +124,18 @@ data class TrackData(
 )
 
 class CrownDriftView(context: Context) : View(context) {
-    private val prefs = context.getSharedPreferences("crowndrift_3d", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences("crowndrift_v6", Context.MODE_PRIVATE)
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val polyPath = Path()
+    private val arcPath = Path()
+    private val miniPath = Path()
+    private val tempRect = RectF()
 
     @Suppress("DEPRECATION")
     private val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
 
-    // 0 = MENU, 1 = GARAGE, 2 = SETTINGS, 3 = GAME, 4 = WIN
-    private var state = 0
+    // Ekran Durumları: 0=MENU, 1=GARAGE, 2=SETTINGS, 3=GAME, 4=WIN, 5=COOP_LOBBY
+    @Volatile private var state = 0
 
     private val carColors = intArrayOf(
         Color.rgb(30, 105, 255),  // Mavi
@@ -59,61 +147,107 @@ class CrownDriftView(context: Context) : View(context) {
         Color.rgb(240, 240, 240), // Beyaz
         Color.rgb(0, 225, 255)    // Turkuaz
     )
-    private val carModels = arrayOf("STREET", "SPORT", "JDM", "HYPER")
+    private val carModels = arrayOf("STREET", "SPORT", "JDM GT", "HYPER")
     private var selectedColor = prefs.getInt("color", 0)
     private var selectedModel = prefs.getInt("model", 1)
 
     // Ayarlar
-    private var sensLevel = prefs.getInt("sens", 1) // 0: LOW, 1: MEDIUM, 2: HIGH
-    private var gfxHigh = prefs.getBoolean("gfx", true)
+    private var sensLevel = prefs.getInt("sens", 1)
     private var ghostEnabled = prefs.getBoolean("ghost", true)
     private var botsEnabled = prefs.getBoolean("bots", true)
     private var showFps = prefs.getBoolean("fps", false)
 
-    // 5 Pist
+    // Çok Virajlı (S-Şikan ve U-Hairpin) Yarış Pistleri
     private val tracks = listOf(
-        TrackData("Classic", 0, 7150, listOf(
-            Vec2(0f, -600f), Vec2(480f, -480f), Vec2(660f, 0f), Vec2(440f, 520f),
-            Vec2(0f, 620f), Vec2(-480f, 440f), Vec2(-620f, -140f), Vec2(-360f, -520f)
+        TrackData("Classic GP", 0, 8000, listOf(
+            Vec2(0f, -1400f), Vec2(850f, -1350f), Vec2(1350f, -850f),
+            Vec2(900f, -300f), Vec2(1450f, 200f), Vec2(1250f, 950f),
+            Vec2(450f, 700f), Vec2(150f, 1350f), Vec2(-650f, 1400f),
+            Vec2(-1250f, 850f), Vec2(-750f, 200f), Vec2(-1400f, -350f),
+            Vec2(-1150f, -1100f), Vec2(-500f, -1350f)
         )),
-        TrackData("Cyber", 1, 8500, listOf(
-            Vec2(-380f, -640f), Vec2(500f, -640f), Vec2(740f, -320f), Vec2(600f, 40f),
-            Vec2(-140f, 90f), Vec2(-260f, 360f), Vec2(360f, 400f), Vec2(480f, 680f),
-            Vec2(-480f, 680f), Vec2(-700f, 220f), Vec2(-660f, -300f)
+        TrackData("Cyber Touge", 1, 9500, listOf(
+            Vec2(-700f, -1450f), Vec2(900f, -1450f), Vec2(1500f, -950f),
+            Vec2(750f, -450f), Vec2(1400f, 50f), Vec2(600f, 450f),
+            Vec2(1250f, 1050f), Vec2(500f, 1500f), Vec2(-450f, 1100f),
+            Vec2(-1100f, 1500f), Vec2(-1550f, 800f), Vec2(-900f, 150f),
+            Vec2(-1500f, -500f), Vec2(-1250f, -1200f)
         )),
-        TrackData("Tokyo", 2, 9200, listOf(
-            Vec2(0f, -680f), Vec2(580f, -580f), Vec2(700f, -100f), Vec2(220f, 100f),
-            Vec2(660f, 480f), Vec2(260f, 720f), Vec2(-520f, 580f), Vec2(-220f, 100f),
-            Vec2(-660f, -220f), Vec2(-520f, -660f)
+        TrackData("Tokyo Bay", 2, 10200, listOf(
+            Vec2(0f, -1550f), Vec2(1100f, -1350f), Vec2(1550f, -550f),
+            Vec2(650f, -150f), Vec2(450f, 450f), Vec2(1450f, 750f),
+            Vec2(1150f, 1450f), Vec2(150f, 1550f), Vec2(-450f, 900f),
+            Vec2(-1200f, 1350f), Vec2(-1550f, 500f), Vec2(-800f, -150f),
+            Vec2(-1500f, -800f), Vec2(-950f, -1450f)
         )),
-        TrackData("Glacier", 3, 8000, listOf(
-            Vec2(0f, -660f), Vec2(550f, -520f), Vec2(740f, 100f), Vec2(360f, 660f),
-            Vec2(-360f, 660f), Vec2(-740f, 100f), Vec2(-550f, -520f)
+        TrackData("Glacier S", 3, 8800, listOf(
+            Vec2(0f, -1450f), Vec2(1050f, -1200f), Vec2(1500f, -300f),
+            Vec2(750f, 250f), Vec2(1350f, 950f), Vec2(600f, 1500f),
+            Vec2(-550f, 1450f), Vec2(-1350f, 900f), Vec2(-700f, 200f),
+            Vec2(-1500f, -400f), Vec2(-1050f, -1250f)
         )),
-        TrackData("Canyon", 4, 10000, listOf(
-            Vec2(-300f, -700f), Vec2(480f, -660f), Vec2(740f, -220f), Vec2(300f, 150f),
-            Vec2(700f, 550f), Vec2(100f, 760f), Vec2(-550f, 660f), Vec2(-740f, 150f),
-            Vec2(-300f, -150f), Vec2(-700f, -480f)
+        TrackData("Canyon Hairpin", 4, 11500, listOf(
+            Vec2(-600f, -1550f), Vec2(950f, -1500f), Vec2(1600f, -800f),
+            Vec2(550f, -350f), Vec2(1550f, 250f), Vec2(650f, 750f),
+            Vec2(1400f, 1350f), Vec2(200f, 1650f), Vec2(-650f, 1050f),
+            Vec2(-1350f, 1500f), Vec2(-1650f, 600f), Vec2(-750f, 0f),
+            Vec2(-1600f, -650f), Vec2(-1250f, -1350f)
         ))
     )
     private var currentTrackIdx = 0
 
-    private val trackPts = mutableListOf<Vec2>()
-    private val trackNormals = mutableListOf<Vec2>()
-    private val trackTangents = mutableListOf<Float>()
-    private val roadHalfWidth = 52f
+    private val trackPts = ArrayList<Vec2>(450)
+    private val trackNormals = ArrayList<Vec2>(450)
+    private val trackTangents = ArrayList<Float>(450)
+    private val obstacles = ArrayList<Obstacle3D>(40)
+    private val roadHalfWidth = 58f
 
-    // Fizik Değişkenleri
+    // Oyuncu Araç Fiziği ve Yana Yatma (Body Roll) Değişkenleri
     private var carX = 0f
     private var carY = 0f
+    private var carZ = 0f
+    private var carVZ = 0f
     private var carYaw = 0f
     private var velYaw = 0f
+    private var speed = 0f
     private var camYaw = 0f
+
+    private var bodyRollAngle = 0f // Virajda sağa/sola yatma açısı (iki tekere kalkma)
+    private var bodyRollVel = 0f
+    private var isOffRoad = false
+
+    private var reverseGear = false
+    private var isBraking = false
     private var steerInput = 0f
+    private var prevSteerInput = 0f
     private var crownSteer = 0f
     private var touchSteer = 0f
-    private var isTouchingScreen = false
+    private var isTouchingSteer = false
 
+    // Hasar, Patlama ve Olduğu Yerde Yeniden Doğma Değişkenleri
+    private var carDamage = 0f
+    private var spoilerBroken = false
+    private var bumperBroken = false
+    private var isCrashing = false
+    private var crashTimer = 0f
+    private var crashSpotX = 0f
+    private var crashSpotY = 0f
+    private var flipRollAngle = 0f
+    private var respawnBannerTimer = 0f
+
+    // 60 FPS İçin Önceden Ayrılmış (Pre-allocated) Havuzlar
+    private val debrisPool = Array(32) { DebrisPart() }
+    private var debrisHead = 0
+    private val particlePool = Array(36) { Particle3D() }
+    private var particleHead = 0
+    private val tirePool = Array(130) { TireMark() }
+    private var tireHead = 0
+
+    private var prevBackLX = 0f; private var prevBackLY = 0f
+    private var prevBackRX = 0f; private var prevBackRY = 0f
+    private var hasPrevSkid = false
+
+    // Yarış Bilgileri
     private var lap = 1
     private val totalLaps = 3
     private var currentWp = 0
@@ -130,18 +264,22 @@ class CrownDriftView(context: Context) : View(context) {
     private var isNewRecord = false
 
     // Ghost ve Botlar
-    private val currentLapRecording = mutableListOf<GhostPose>()
+    private val currentLapRecording = ArrayList<GhostPose>(1200)
     private var bestLapGhost = listOf<GhostPose>()
     private var ghostFrameIdx = 0
-    private val bots = mutableListOf<BotCar>()
+    private val bots = ArrayList<BotCar>(3)
 
-    private data class TireMark(val lx1: Float, val ly1: Float, val lx2: Float, val ly2: Float, val rx1: Float, val ry1: Float, val rx2: Float, val ry2: Float)
-    private val tireMarks = mutableListOf<TireMark>()
-    private var prevBackLX = 0f
-    private var prevBackLY = 0f
-    private var prevBackRX = 0f
-    private var prevBackRY = 0f
-    private var hasPrevSkid = false
+    // ==================== 4 KİŞİLİK BLUETOOTH ODA (LOBBY) SİSTEMİ ====================
+    private val btUuid: UUID = UUID.fromString("8ce255c0-200a-11e0-ac64-0800200c9a66")
+    @Volatile private var lobbyRole = 0 // 0=Yok, 1=HOST (Oda Kurucu), 2=CLIENT (Katılımcı)
+    @Volatile private var lobbyStatusText = "Mod Secin"
+    @Volatile private var btRunning = false
+    private var btServerSocket: BluetoothServerSocket? = null
+    private val hostClientSockets = CopyOnWriteArrayList<BluetoothSocket>()
+    private var clientSocket: BluetoothSocket? = null
+
+    // En fazla 3 diğer oyuncu (Toplam 4 Kişi: Sen + 3 Uzak Oyuncu)
+    private val remotePlayers = Array(3) { RemotePlayer() }
 
     // 3B Projeksiyon Geçici Değişkenleri
     private var projX = 0f
@@ -155,7 +293,28 @@ class CrownDriftView(context: Context) : View(context) {
     init {
         isFocusable = true
         isFocusableInTouchMode = true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            defaultFocusHighlightEnabled = false
+        }
         buildTrackSpline(0)
+    }
+
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        super.onLayout(changed, left, top, right, bottom)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && width > 0 && height > 0) {
+            systemGestureExclusionRects = listOf(Rect(0, 0, width, height))
+        }
+    }
+
+    fun onSideButtonPressed(): Boolean {
+        return if (state != 0) {
+            state = 0
+            vibeClick()
+            invalidate()
+            true
+        } else {
+            false
+        }
     }
 
     private fun saveSettings() {
@@ -163,11 +322,214 @@ class CrownDriftView(context: Context) : View(context) {
             .putInt("color", selectedColor)
             .putInt("model", selectedModel)
             .putInt("sens", sensLevel)
-            .putBoolean("gfx", gfxHigh)
             .putBoolean("ghost", ghostEnabled)
             .putBoolean("bots", botsEnabled)
             .putBoolean("fps", showFps)
             .apply()
+    }
+
+    // ==================== 4 OYUNCULU BLUETOOTH HOST & CLIENT MOTORU ====================
+    fun stopAllBluetooth() {
+        btRunning = false
+        lobbyRole = 0
+        try { btServerSocket?.close() } catch (_: Throwable) {}
+        for (s in hostClientSockets) {
+            try { s.close() } catch (_: Throwable) {}
+        }
+        hostClientSockets.clear()
+        try { clientSocket?.close() } catch (_: Throwable) {}
+        clientSocket = null
+        for (rp in remotePlayers) rp.active = false
+    }
+
+    private fun startHostLobby() {
+        stopAllBluetooth()
+        lobbyRole = 1
+        btRunning = true
+        lobbyStatusText = "Oda Acildi (1/4)"
+
+        thread(start = true, isDaemon = true) {
+            try {
+                val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+                val adapter = bm?.adapter
+                if (adapter == null || !adapter.isEnabled) {
+                    lobbyStatusText = "BT Kapali!"
+                    return@thread
+                }
+                val server = adapter.listenUsingInsecureRfcommWithServiceRecord("CrownDriftRoom", btUuid)
+                btServerSocket = server
+
+                while (btRunning && lobbyRole == 1 && hostClientSockets.size < 3) {
+                    val sock = server.accept() ?: break
+                    val slot = hostClientSockets.size
+                    if (slot < 3) {
+                        hostClientSockets.add(sock)
+                        remotePlayers[slot].active = true
+                        remotePlayers[slot].name = try { sock.remoteDevice?.name ?: "Oyuncu ${slot + 2}" } catch (_: SecurityException) { "Oyuncu ${slot + 2}" }
+                        lobbyStatusText = "Bagli: ${hostClientSockets.size + 1}/4 Oyuncu"
+                        vibeClick()
+                        handleHostClientConnection(sock, slot)
+                    } else {
+                        sock.close()
+                    }
+                }
+            } catch (_: Throwable) {
+                if (lobbyRole == 1 && hostClientSockets.isEmpty()) {
+                    lobbyStatusText = "Oda Hazir (1/4)"
+                }
+            }
+        }
+    }
+
+    private fun handleHostClientConnection(sock: BluetoothSocket, slot: Int) {
+        // 1. İstemciden Gelen Konumu Oku
+        thread(start = true, isDaemon = true) {
+            try {
+                val inp = DataInputStream(sock.inputStream)
+                while (btRunning && lobbyRole == 1 && sock.isConnected) {
+                    remotePlayers[slot].x = inp.readFloat()
+                    remotePlayers[slot].y = inp.readFloat()
+                    remotePlayers[slot].yaw = inp.readFloat()
+                    remotePlayers[slot].roll = inp.readFloat()
+                    remotePlayers[slot].colorIdx = inp.readInt().coerceIn(0, 7)
+                }
+            } catch (_: Throwable) {
+                remotePlayers[slot].active = false
+                hostClientSockets.remove(sock)
+                lobbyStatusText = "Bagli: ${hostClientSockets.size + 1}/4 Oyuncu"
+            }
+        }
+
+        // 2. İstemciye Oyun Durumunu (START komutu, Harita) ve Diğer 3 Oyuncunun Konumunu Gönder
+        thread(start = true, isDaemon = true) {
+            try {
+                val out = DataOutputStream(sock.outputStream)
+                while (btRunning && lobbyRole == 1 && sock.isConnected) {
+                    out.writeInt(state)
+                    out.writeInt(currentTrackIdx)
+                    out.writeInt(hostClientSockets.size + 1)
+
+                    // Host (Oyuncu 1) verisi
+                    out.writeFloat(carX)
+                    out.writeFloat(carY)
+                    out.writeFloat(carYaw)
+                    out.writeFloat(bodyRollAngle)
+                    out.writeInt(selectedColor)
+
+                    // Diğer İstemcilerin Verisi
+                    for (i in 0..2) {
+                        if (i != slot) {
+                            val rp = remotePlayers[i]
+                            out.writeBoolean(rp.active)
+                            out.writeFloat(rp.x)
+                            out.writeFloat(rp.y)
+                            out.writeFloat(rp.yaw)
+                            out.writeFloat(rp.roll)
+                            out.writeInt(rp.colorIdx)
+                        }
+                    }
+                    out.flush()
+                    Thread.sleep(45)
+                }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun joinHostLobby() {
+        stopAllBluetooth()
+        lobbyRole = 2
+        btRunning = true
+        lobbyStatusText = "Oda Araniyor..."
+
+        thread(start = true, isDaemon = true) {
+            try {
+                val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+                val adapter = bm?.adapter
+                if (adapter == null || !adapter.isEnabled) {
+                    lobbyStatusText = "BT Kapali!"
+                    return@thread
+                }
+                val bonded = try { adapter.bondedDevices } catch (_: SecurityException) { null }
+                if (bonded.isNullOrEmpty()) {
+                    lobbyStatusText = "Eslesmis Saat Yok"
+                    return@thread
+                }
+                for (dev in bonded) {
+                    if (!btRunning || lobbyRole != 2) break
+                    try {
+                        val sock = dev.createInsecureRfcommSocketToServiceRecord(btUuid)
+                        sock.connect()
+                        clientSocket = sock
+                        remotePlayers[0].active = true
+                        remotePlayers[0].name = try { dev.name ?: "Kurucu" } catch (_: SecurityException) { "Kurucu" }
+                        lobbyStatusText = "Odaya Baglandi! Start Bekleniyor"
+                        vibeClick()
+                        handleClientConnection(sock)
+                        return@thread
+                    } catch (_: Throwable) {}
+                }
+                lobbyStatusText = "Acik Oda Bulunamadi"
+            } catch (_: Throwable) {
+                lobbyStatusText = "Baglanti Hatasi"
+            }
+        }
+    }
+
+    private fun handleClientConnection(sock: BluetoothSocket) {
+        // İstemci Kendi Konumunu Host'a Gönderir
+        thread(start = true, isDaemon = true) {
+            try {
+                val out = DataOutputStream(sock.outputStream)
+                while (btRunning && lobbyRole == 2 && sock.isConnected) {
+                    out.writeFloat(carX)
+                    out.writeFloat(carY)
+                    out.writeFloat(carYaw)
+                    out.writeFloat(bodyRollAngle)
+                    out.writeInt(selectedColor)
+                    out.flush()
+                    Thread.sleep(45)
+                }
+            } catch (_: Throwable) {}
+        }
+
+        // Host'tan Gelen Başlatma Komutunu ve Tüm Oyuncuların Konumunu Alır
+        try {
+            val inp = DataInputStream(sock.inputStream)
+            while (btRunning && lobbyRole == 2 && sock.isConnected) {
+                val hostState = inp.readInt()
+                val hostTrack = inp.readInt().coerceIn(0, tracks.size - 1)
+                val totalPlayers = inp.readInt()
+                lobbyStatusText = "Odada $totalPlayers/4 Oyuncu Var"
+
+                // Host Konumu (Slot 0)
+                remotePlayers[0].active = true
+                remotePlayers[0].x = inp.readFloat()
+                remotePlayers[0].y = inp.readFloat()
+                remotePlayers[0].yaw = inp.readFloat()
+                remotePlayers[0].roll = inp.readFloat()
+                remotePlayers[0].colorIdx = inp.readInt().coerceIn(0, 7)
+
+                // Diğer 2 Oyuncu (Slot 1 ve Slot 2)
+                for (slotIdx in 1..2) {
+                    val act = inp.readBoolean()
+                    remotePlayers[slotIdx].active = act
+                    remotePlayers[slotIdx].x = inp.readFloat()
+                    remotePlayers[slotIdx].y = inp.readFloat()
+                    remotePlayers[slotIdx].yaw = inp.readFloat()
+                    remotePlayers[slotIdx].roll = inp.readFloat()
+                    remotePlayers[slotIdx].colorIdx = inp.readInt().coerceIn(0, 7)
+                }
+
+                // Host START'a Bastığı Anda Yarışı Otomatik Başlat!
+                if (hostState == 3 && state != 3) {
+                    currentTrackIdx = hostTrack
+                    post { startRace(fromNetwork = true) }
+                }
+            }
+        } catch (_: Throwable) {
+            remotePlayers[0].active = false
+            lobbyStatusText = "Oda Baglantisi Koptu"
+        }
     }
 
     private fun triggerHaptic(durationMs: Long, amplitude: Int) {
@@ -181,40 +543,42 @@ class CrownDriftView(context: Context) : View(context) {
         } catch (_: Exception) {}
     }
 
-    private fun vibeClick() = triggerHaptic(28L, 200)
+    private fun vibeClick() = triggerHaptic(22L, 190)
 
-    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
-        if (event.action == MotionEvent.ACTION_SCROLL) {
-            var delta = -event.getAxisValue(MotionEvent.AXIS_SCROLL)
-            if (delta == 0f) delta = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
-            if (delta == 0f) delta = event.getAxisValue(MotionEvent.AXIS_HSCROLL)
-            if (delta != 0f) {
-                when (state) {
-                    0 -> {
-                        if (delta > 0) currentTrackIdx = (currentTrackIdx + 1) % tracks.size
-                        else currentTrackIdx = (currentTrackIdx - 1 + tracks.size) % tracks.size
-                        buildTrackSpline(currentTrackIdx)
-                        vibeClick()
-                    }
-                    1 -> {
-                        selectedColor = (selectedColor + if (delta > 0) 1 else 7) % 8
-                        saveSettings()
-                        vibeClick()
-                    }
-                    3 -> {
-                        val sensMult = when (sensLevel) {
-                            0 -> 0.32f
-                            1 -> 0.52f
-                            else -> 0.78f
-                        }
-                        crownSteer = (crownSteer + delta.coerceIn(-1.5f, 1.5f) * sensMult).coerceIn(-1f, 1f)
-                        triggerHaptic(16L, 140)
-                    }
+    fun handleRotaryScroll(event: MotionEvent): Boolean {
+        var delta = -event.getAxisValue(MotionEvent.AXIS_SCROLL)
+        if (delta == 0f) delta = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
+        if (delta == 0f) delta = event.getAxisValue(MotionEvent.AXIS_HSCROLL)
+        if (delta == 0f) return false
+
+        when (state) {
+            0 -> {
+                if (delta > 0) currentTrackIdx = (currentTrackIdx + 1) % tracks.size
+                else currentTrackIdx = (currentTrackIdx - 1 + tracks.size) % tracks.size
+                buildTrackSpline(currentTrackIdx)
+                vibeClick()
+            }
+            1 -> {
+                selectedColor = (selectedColor + if (delta > 0) 1 else 7) % 8
+                saveSettings()
+                vibeClick()
+            }
+            3 -> {
+                val sensMult = when (sensLevel) {
+                    0 -> 0.28f
+                    1 -> 0.46f
+                    else -> 0.70f
                 }
-                invalidate()
-                return true
+                crownSteer = (crownSteer + delta.coerceIn(-1.5f, 1.5f) * sensMult).coerceIn(-1f, 1f)
+                triggerHaptic(12L, 115)
             }
         }
+        invalidate()
+        return true
+    }
+
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if (event.action == MotionEvent.ACTION_SCROLL && handleRotaryScroll(event)) return true
         return super.onGenericMotionEvent(event)
     }
 
@@ -222,9 +586,11 @@ class CrownDriftView(context: Context) : View(context) {
         trackPts.clear()
         trackNormals.clear()
         trackTangents.clear()
+        obstacles.clear()
+
         val cps = tracks[idx].controlPoints
         val n = cps.size
-        val stepsPerSeg = 24
+        val stepsPerSeg = 26
         for (i in 0 until n) {
             val p0 = cps[(i - 1 + n) % n]
             val p1 = cps[i]
@@ -250,23 +616,69 @@ class CrownDriftView(context: Context) : View(context) {
             val dx = next.x - prev.x
             val dy = next.y - prev.y
             val len = hypot(dx, dy).coerceAtLeast(0.001f)
-            trackNormals.add(Vec2(-dy / len, dx / len))
+            val nx = -dy / len
+            val ny = dx / len
+            trackNormals.add(Vec2(nx, ny))
             trackTangents.add(atan2(dy, dx))
+
+            // Çim Alanlara Ağaç ve Bina Engelleri Yerleştir
+            if (i % 18 == 0) {
+                val side = if ((i / 18) % 2 == 0) 1f else -1f
+                val distFromRoad = roadHalfWidth + 68f + (i % 35)
+                val ox = trackPts[i].x + nx * side * distFromRoad
+                val oy = trackPts[i].y + ny * side * distFromRoad
+                val isTree = (i / 18) % 3 != 0
+                obstacles.add(Obstacle3D(ox, oy, if (isTree) 16f else 26f, if (isTree) 34f else 48f, isTree))
+            }
         }
     }
 
-    private fun startRace() {
+    private fun startRace(fromNetwork: Boolean = false) {
         buildTrackSpline(currentTrackIdx)
         val p0 = trackPts[0]
-        carX = p0.x
-        carY = p0.y
+        val n0 = trackNormals[0]
+        val startOffset = if (lobbyRole == 2) 16f else if (lobbyRole == 1) -16f else 0f
+        carX = p0.x + n0.x * startOffset
+        carY = p0.y + n0.y * startOffset
+        carZ = 0f
+        carVZ = 0f
         carYaw = trackTangents[0]
         velYaw = carYaw
         camYaw = carYaw
+        speed = 110f
+        bodyRollAngle = 0f
+        bodyRollVel = 0f
+        isOffRoad = false
+
+        reverseGear = false
+        isBraking = false
         steerInput = 0f
+        prevSteerInput = 0f
         crownSteer = 0f
         touchSteer = 0f
-        isTouchingScreen = false
+        isTouchingSteer = false
+
+        carDamage = 0f
+        spoilerBroken = false
+        bumperBroken = false
+        isCrashing = false
+        crashTimer = 0f
+        flipRollAngle = 0f
+        respawnBannerTimer = 0f
+
+        for (d in debrisPool) d.active = false
+        for (p in particlePool) p.active = false
+        for (tm in tirePool) tm.active = false
+        hasPrevSkid = false
+        currentLapRecording.clear()
+        ghostFrameIdx = 0
+
+        bots.clear()
+        if (botsEnabled) {
+            bots.add(BotCar(wpFloat = 4f, laneOffset = -18f, targetLane = -18f, speedFactor = 0.55f, color = Color.rgb(255, 195, 20)))
+            bots.add(BotCar(wpFloat = 8f, laneOffset = 18f, targetLane = 18f, speedFactor = 0.60f, color = Color.rgb(235, 45, 90)))
+            updateBots(0.01f)
+        }
 
         lap = 1
         currentWp = 0
@@ -275,26 +687,89 @@ class CrownDriftView(context: Context) : View(context) {
         score = 0f
         driftCombo = 1
         driftTimer = 0f
-        tireMarks.clear()
-        hasPrevSkid = false
-        currentLapRecording.clear()
-        ghostFrameIdx = 0
-
-        bots.clear()
-        if (botsEnabled) {
-            bots.add(BotCar(wpFloat = 3f, laneOffset = -18f, targetLane = -18f, speedFactor = 0.90f, color = Color.rgb(255, 195, 20)))
-            bots.add(BotCar(wpFloat = 6f, laneOffset = 18f, targetLane = 18f, speedFactor = 0.96f, color = Color.rgb(235, 45, 90)))
-            updateBots(0.01f)
-        }
 
         lapStartTime = SystemClock.uptimeMillis()
         bestLapTime = prefs.getFloat("best_lap_$currentTrackIdx", 99.99f)
         isNewRecord = false
         state = 3
+        if (!fromNetwork) vibeClick()
         requestFocus()
     }
 
+    private fun spawnDebris(ix: Float, iy: Float, count: Int, baseCol: Int) {
+        for (i in 0 until count) {
+            val d = debrisPool[debrisHead]
+            debrisHead = (debrisHead + 1) % debrisPool.size
+            val ang = Random.nextFloat() * 6.28f
+            val spd = 40f + Random.nextFloat() * 95f
+            d.active = true
+            d.x = ix; d.y = iy; d.z = 4f + Random.nextFloat() * 6f
+            d.vx = cos(ang) * spd
+            d.vy = sin(ang) * spd
+            d.vz = 65f + Random.nextFloat() * 90f
+            d.yaw = ang
+            d.size = 2.8f + Random.nextFloat() * 3.0f
+            d.color = if (i % 2 == 0) baseCol else Color.rgb(40, 40, 45)
+            d.life = 5.5f
+        }
+    }
+
+    private fun spawnParticle(px: Float, py: Float, pz: Float, vx: Float, vy: Float, vz: Float, sz: Float, col: Int, alpha: Int) {
+        val p = particlePool[particleHead]
+        particleHead = (particleHead + 1) % particlePool.size
+        p.active = true
+        p.x = px; p.y = py; p.z = pz
+        p.vx = vx; p.vy = vy; p.vz = vz
+        p.size = sz; p.color = col; p.alpha = alpha
+    }
+
+    // Araç Patladığında veya Devrildiğinde PATLADIĞI YERİ Kaydeder
+    private fun triggerExplosionOrRollover(isFlip: Boolean) {
+        if (isCrashing) return
+        isCrashing = true
+        crashTimer = 2.1f // 2.1 saniye sonra olduğu yerde doğacak
+        crashSpotX = carX
+        crashSpotY = carY
+        carVZ = if (isFlip) 130f else 155f
+        speed *= 0.25f
+
+        spawnDebris(carX, carY, 12, carColors[selectedColor])
+        // Patlama Alev Parçacıkları
+        for (i in 0 until 14) {
+            val ang = Random.nextFloat() * 6.28f
+            val spd = 20f + Random.nextFloat() * 60f
+            val fireCol = if (i % 2 == 0) Color.rgb(255, 110, 20) else Color.rgb(255, 210, 40)
+            spawnParticle(carX, carY, 5f, cos(ang) * spd, sin(ang) * spd, 40f + Random.nextFloat() * 50f, 5.5f, fireCol, 240)
+        }
+        triggerHaptic(190L, 255)
+    }
+
+    // Pistin Başına Değil, TAM PATLADIĞI / DEVRİLDİĞİ YERDE Yeniden Doğar!
+    private fun respawnAtCrashSpot() {
+        isCrashing = false
+        flipRollAngle = 0f
+        bodyRollAngle = 0f
+        bodyRollVel = 0f
+        carZ = 0f
+        carVZ = 0f
+        carDamage = 0f
+        spoilerBroken = false
+        bumperBroken = false
+
+        // Tam patladığı koordinatta doğar
+        carX = crashSpotX
+        carY = crashSpotY
+        carYaw = trackTangents[currentWp]
+        velYaw = carYaw
+        speed = 70f
+        reverseGear = false
+        respawnBannerTimer = 1.5f
+        triggerHaptic(55L, 200)
+    }
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        parent?.requestDisallowInterceptTouchEvent(true)
+
         val cx = width / 2f
         val cy = height / 2f
         val R = min(width, height) / 2f
@@ -303,7 +778,7 @@ class CrownDriftView(context: Context) : View(context) {
 
         when (state) {
             0 -> if (event.action == MotionEvent.ACTION_DOWN) {
-                if (y in (cy - R * 0.35f)..(cy + R * 0.2f)) {
+                if (y in (cy - R * 0.35f)..(cy + R * 0.18f)) {
                     if (x < cx - R * 0.42f) {
                         currentTrackIdx = (currentTrackIdx - 1 + tracks.size) % tracks.size
                         buildTrackSpline(currentTrackIdx); vibeClick()
@@ -312,11 +787,14 @@ class CrownDriftView(context: Context) : View(context) {
                         buildTrackSpline(currentTrackIdx); vibeClick()
                     }
                 }
-                if (hypot(x - (cx - R * 0.56f), y - (cy + R * 0.34f)) < R * 0.22f) {
-                    state = 1; vibeClick()
-                } else if (hypot(x - (cx + R * 0.56f), y - (cy + R * 0.34f)) < R * 0.22f) {
-                    state = 2; vibeClick()
-                } else if (y > cy + R * 0.48f && abs(x - cx) < R * 0.50f) {
+                // Sol Alt: CO-OP ODA (4 Kişilik Lobi)ve Garaj
+                if (hypot(x - (cx - R * 0.60f), y - (cy + R * 0.32f)) < R * 0.20f) {
+                    state = 1; vibeClick() // Garaj
+                } else if (hypot(x - (cx + R * 0.60f), y - (cy + R * 0.32f)) < R * 0.20f) {
+                    state = 2; vibeClick() // Ayarlar
+                } else if (y in (cy + R * 0.34f)..(cy + R * 0.54f) && abs(x - cx) < R * 0.36f) {
+                    state = 5; vibeClick() // 4 Kişilik Co-op Oda Ekranı
+                } else if (y > cy + R * 0.54f && abs(x - cx) < R * 0.50f) {
                     vibeClick(); startRace()
                 }
             }
@@ -341,7 +819,7 @@ class CrownDriftView(context: Context) : View(context) {
 
             2 -> if (event.action == MotionEvent.ACTION_DOWN) {
                 if (y in (cy - R * 0.66f)..(cy - R * 0.38f)) { sensLevel = (sensLevel + 1) % 3; saveSettings(); vibeClick() }
-                else if (y in (cy - R * 0.37f)..(cy - R * 0.11f)) { gfxHigh = !gfxHigh; saveSettings(); vibeClick() }
+                else if (y in (cy - R * 0.37f)..(cy - R * 0.11f)) { state = 5; vibeClick() }
                 else if (y in (cy - R * 0.10f)..(cy + R * 0.16f)) { ghostEnabled = !ghostEnabled; saveSettings(); vibeClick() }
                 else if (y in (cy + R * 0.17f)..(cy + R * 0.44f)) { botsEnabled = !botsEnabled; saveSettings(); vibeClick() }
                 else if (y > cy + R * 0.46f) {
@@ -350,16 +828,53 @@ class CrownDriftView(context: Context) : View(context) {
                 }
             }
 
-            3 -> {
-                if (event.action == MotionEvent.ACTION_DOWN && y < cy - R * 0.45f && abs(x - cx) < R * 0.42f) {
-                    state = 0; vibeClick(); return true
+            5 -> if (event.action == MotionEvent.ACTION_DOWN) {
+                // 4 Kişilik Co-op Lobi Kontrolleri
+                if (y in (cy - R * 0.45f)..(cy - R * 0.15f)) {
+                    if (x < cx) startHostLobby() else joinHostLobby()
+                    vibeClick()
+                } else if (y in (cy + R * 0.42f)..(cy + R * 0.72f) && abs(x - cx) < R * 0.48f) {
+                    // Host START'a basınca bağlı olan herkes için yarışı başlatır!
+                    if (lobbyRole != 2) {
+                        startRace()
+                    }
+                } else if (y > cy + R * 0.73f) {
+                    state = 0; vibeClick()
                 }
+            }
+
+            3 -> {
+                val gearBtnX = cx - R * 0.55f
+                val gearBtnY = cy + R * 0.48f
+                val brakeBtnX = cx + R * 0.55f
+                val brakeBtnY = cy + R * 0.48f
+
+                if (event.action == MotionEvent.ACTION_DOWN) {
+                    if (hypot(x - gearBtnX, y - gearBtnY) < R * 0.22f) {
+                        reverseGear = !reverseGear
+                        vibeClick()
+                        return true
+                    }
+                    if (hypot(x - brakeBtnX, y - brakeBtnY) < R * 0.22f) {
+                        isBraking = true
+                        vibeClick()
+                        return true
+                    }
+                }
+
                 if (event.action == MotionEvent.ACTION_DOWN || event.action == MotionEvent.ACTION_MOVE) {
-                    isTouchingScreen = true
-                    val sensMult = when (sensLevel) { 0 -> 0.80f; 1 -> 1.10f; else -> 1.45f }
-                    touchSteer = (((x - cx) / (R * 0.60f)) * sensMult).coerceIn(-1f, 1f)
+                    if (hypot(x - brakeBtnX, y - brakeBtnY) < R * 0.24f) {
+                        isBraking = true
+                        isTouchingSteer = false
+                    } else if (hypot(x - gearBtnX, y - gearBtnY) > R * 0.20f) {
+                        isBraking = false
+                        isTouchingSteer = true
+                        val sensMult = when (sensLevel) { 0 -> 0.80f; 1 -> 1.10f; else -> 1.45f }
+                        touchSteer = (((x - cx) / (R * 0.60f)) * sensMult).coerceIn(-1f, 1f)
+                    }
                 } else if (event.action == MotionEvent.ACTION_UP || event.action == MotionEvent.ACTION_CANCEL) {
-                    isTouchingScreen = false
+                    isBraking = false
+                    isTouchingSteer = false
                     touchSteer = 0f
                 }
             }
@@ -392,14 +907,11 @@ class CrownDriftView(context: Context) : View(context) {
         val cy = height / 2f
         val R = min(width, height) / 2f
 
-        val clipPath = Path().apply { addCircle(cx, cy, R, Path.Direction.CW) }
-        canvas.save()
-        canvas.clipPath(clipPath)
-
         when (state) {
             0 -> drawMainMenu(canvas, cx, cy, R)
             1 -> drawGarage(canvas, cx, cy, R)
             2 -> drawSettings(canvas, cx, cy, R)
+            5 -> drawCoopLobby(canvas, cx, cy, R)
             3 -> {
                 updateGamePhysics(dt, now)
                 drawTrue3DWorld(canvas, cx, cy, R)
@@ -413,34 +925,31 @@ class CrownDriftView(context: Context) : View(context) {
 
         if (showFps) {
             paint.color = Color.GREEN
-            paint.textSize = R * 0.075f
+            paint.textSize = R * 0.070f
             paint.textAlign = Paint.Align.CENTER
-            canvas.drawText("$currentFps FPS", cx, cy - R * 0.86f, paint)
+            canvas.drawText("$currentFps FPS", cx, cy - R * 0.87f, paint)
         }
 
-        canvas.restore()
         postInvalidateOnAnimation()
     }
 
-    // ==================== GERÇEK 3B PERSPEKTİF PROJEKSİYON MOTORU ====================
+    // ==================== GERÇEK 3B PERSPEKTİF MOTORU ====================
     private fun project3D(wx: Float, wy: Float, wz: Float, cx: Float, cy: Float, R: Float): Boolean {
         val dx = wx - carX
         val dy = wy - carY
         val cosYaw = cos(camYaw)
         val sinYaw = sin(camYaw)
 
-        // Kameraya göre İleri (forward) ve Sağ (right) eksenleri
         val forward = dx * cosYaw + dy * sinYaw
         val right = -dx * sinYaw + dy * cosYaw
 
-        // Kamera aracın 95 birim gerisinde ve 135 birim yüksekte, 47 derece aşağı bakıyor
-        val relF = forward + 95f
-        val relH = wz - 135f
+        val relF = forward + 98f
+        val relH = wz - 138f
         val cosP = 0.682f
         val sinP = 0.731f
 
         val depth = relF * cosP - relH * sinP
-        if (depth < 18f) return false
+        if (depth < 16f || depth > 1450f) return false
         val vert = relF * sinP + relH * cosP
 
         val fov = R * 1.48f
@@ -479,78 +988,119 @@ class CrownDriftView(context: Context) : View(context) {
         canvas.drawPath(polyPath, paint)
     }
 
-    private fun draw3DBox(
+    // Yana Yatma (Roll) Destekli 3B Kutu Çizici (İki Tekere Kalkma Görünümü)
+    private fun drawTilted3DBox(
         canvas: Canvas, cx: Float, cy: Float, R: Float,
         bx: Float, by: Float, bz: Float,
         halfL: Float, halfW: Float, height: Float,
-        yaw: Float, topColor: Int, sideColor: Int, rearColor: Int
+        yaw: Float, roll: Float,
+        topColor: Int, sideColor: Int, rearColor: Int
     ) {
         val c = cos(yaw)
         val s = sin(yaw)
         val fx = c * halfL; val fy = s * halfL
         val rx = -s * halfW; val ry = c * halfW
 
-        // 4 Alt Köşe: FL(0), FR(1), RR(2), RL(3)
+        // Roll açısına göre sol ve sağ kenarların Z yüksekliği farkı
+        val sinR = sin(roll)
+        val leftLift = (-sinR * halfW).coerceAtLeast(-bz)
+        val rightLift = (sinR * halfW).coerceAtLeast(-bz)
+
         val flX = bx + fx - rx; val flY = by + fy - ry
         val frX = bx + fx + rx; val frY = by + fy + ry
         val rrX = bx - fx + rx; val rrY = by - fy + ry
         val rlX = bx - fx - rx; val rlY = by - fy - ry
-        val topZ = bz + height
 
-        // Yan Yüzeyler (Sol ve Sağ)
-        drawQuad3D(canvas, cx, cy, R, flX, flY, bz, rlX, rlY, bz, rlX, rlY, topZ, flX, flY, topZ, sideColor)
-        drawQuad3D(canvas, cx, cy, R, frX, frY, bz, rrX, rrY, bz, rrX, rrY, topZ, frX, frY, topZ, sideColor)
-        // Ön ve Arka Yüzeyler
-        drawQuad3D(canvas, cx, cy, R, flX, flY, bz, frX, frY, bz, frX, frY, topZ, flX, flY, topZ, sideColor)
-        drawQuad3D(canvas, cx, cy, R, rlX, rlY, bz, rrX, rrY, bz, rrX, rrY, topZ, rlX, rlY, topZ, rearColor)
-        // Üst Yüzey (Tavan / Kaput)
-        drawQuad3D(canvas, cx, cy, R, flX, flY, topZ, frX, frY, topZ, rrX, rrY, topZ, rlX, rlY, topZ, topColor)
+        val zFL0 = bz + leftLift; val zFL1 = zFL0 + height
+        val zRL0 = bz + leftLift; val zRL1 = zRL0 + height
+        val zFR0 = bz + rightLift; val zFR1 = zFR0 + height
+        val zRR0 = bz + rightLift; val zRR1 = zRR0 + height
+
+        drawQuad3D(canvas, cx, cy, R, flX, flY, zFL0, rlX, rlY, zRL0, rlX, rlY, zRL1, flX, flY, zFL1, sideColor)
+        drawQuad3D(canvas, cx, cy, R, frX, frY, zFR0, rrX, rrY, zRR0, rrX, rrY, zRR1, frX, frY, zFR1, sideColor)
+        drawQuad3D(canvas, cx, cy, R, flX, flY, zFL0, frX, frY, zFR0, frX, frY, zFR1, flX, flY, zFL1, sideColor)
+        drawQuad3D(canvas, cx, cy, R, rlX, rlY, zRL0, rrX, rrY, zRR0, rrX, rrY, zRR1, rlX, rlY, zRL1, rearColor)
+        drawQuad3D(canvas, cx, cy, R, flX, flY, zFL1, frX, frY, zFR1, rrX, rrY, zRR1, rlX, rlY, zRL1, topColor)
     }
 
-    private fun drawTrue3DCar(
+    private fun drawSport3DCar(
         canvas: Canvas, cx: Float, cy: Float, R: Float,
-        x: Float, y: Float, yaw: Float, baseColor: Int, modelIdx: Int, isGhost: Boolean
+        x: Float, y: Float, zOffset: Float, yaw: Float, roll: Float,
+        baseColor: Int, modelIdx: Int, isGhost: Boolean, isPlayer: Boolean = false
     ) {
         val alpha = if (isGhost) 110 else 255
         val r = Color.red(baseColor)
         val g = Color.green(baseColor)
         val b = Color.blue(baseColor)
 
-        val topCol = Color.argb(alpha, r, g, b)
-        val sideCol = Color.argb(alpha, (r * 0.78f).toInt(), (g * 0.78f).toInt(), (b * 0.78f).toInt())
-        val rearCol = Color.argb(alpha, (r * 0.62f).toInt(), (g * 0.62f).toInt(), (b * 0.62f).toInt())
-        val glassCol = Color.argb(alpha, 180, 235, 255)
+        val damageDarken = if (isPlayer) (1f - (carDamage / 210f)) else 1f
+        val topCol = Color.argb(alpha, (r * damageDarken).toInt(), (g * damageDarken).toInt(), (b * damageDarken).toInt())
+        val sideCol = Color.argb(alpha, (r * 0.76f * damageDarken).toInt(), (g * 0.76f * damageDarken).toInt(), (b * 0.76f * damageDarken).toInt())
+        val rearCol = Color.argb(alpha, (r * 0.58f * damageDarken).toInt(), (g * 0.58f * damageDarken).toInt(), (b * 0.58f * damageDarken).toInt())
+        val glassCol = Color.argb(alpha, 35, 50, 65)
+        val wheelCol = Color.argb(alpha, 20, 22, 25)
 
         val c = cos(yaw)
         val s = sin(yaw)
+        val rxVec = -s
+        val ryVec = c
 
-        // Zemin Gölgesi
         if (!isGhost) {
-            val fx = c * 15f; val fy = s * 15f
-            val rx = -s * 10f; val ry = c * 10f
+            val fx = c * 16f; val fy = s * 16f
+            val rx = rxVec * 10.5f; val ry = ryVec * 10.5f
             drawQuad3D(
                 canvas, cx, cy, R,
                 x + fx - rx, y + fy - ry, 0.2f,
                 x + fx + rx, y + fy + ry, 0.2f,
                 x - fx + rx, y - fy + ry, 0.2f,
                 x - fx - rx, y - fy - ry, 0.2f,
-                Color.argb(130, 0, 0, 0)
+                Color.argb(135, 0, 0, 0)
             )
         }
 
-        // 1. Ana Alt Gövde (3B Kutu)
-        draw3DBox(canvas, cx, cy, R, x, y, 1.5f, 14.5f, 8.8f, 5.5f, yaw, topCol, sideCol, rearCol)
+        val bz = zOffset + 1.4f + abs(sin(roll)) * 3.5f
+        val leftWheelLift = (-sin(roll) * 8f).coerceAtLeast(0f)
+        val rightWheelLift = (sin(roll) * 8f).coerceAtLeast(0f)
 
-        // 2. Üst Cam Kabin ve Tavan (3B Kutu)
-        val cabX = x - c * 1.5f
-        val cabY = y - s * 1.5f
-        draw3DBox(canvas, cx, cy, R, cabX, cabY, 7.0f, 7.5f, 6.8f, 4.5f, yaw, topCol, glassCol, glassCol)
+        // 1. 4 Tekerlek (Virajda Yana Yatınca İç Tekerlekler Havaya Kalkar!)
+        if (!isGhost) {
+            val wxF = 9.5f; val wxR = -9.5f; val wyOff = 9.4f
+            drawTilted3DBox(canvas, cx, cy, R, x + c * wxF - rxVec * wyOff, y + s * wxF - ryVec * wyOff, 0.5f + zOffset + leftWheelLift, 3.4f, 1.6f, 3.6f, yaw + steerInput * 0.35f, roll * 0.5f, wheelCol, wheelCol, wheelCol)
+            drawTilted3DBox(canvas, cx, cy, R, x + c * wxF + rxVec * wyOff, y + s * wxF + ryVec * wyOff, 0.5f + zOffset + rightWheelLift, 3.4f, 1.6f, 3.6f, yaw + steerInput * 0.35f, roll * 0.5f, wheelCol, wheelCol, wheelCol)
+            drawTilted3DBox(canvas, cx, cy, R, x + c * wxR - rxVec * wyOff, y + s * wxR - ryVec * wyOff, 0.5f + zOffset + leftWheelLift, 3.6f, 1.8f, 3.8f, yaw, roll * 0.5f, wheelCol, wheelCol, wheelCol)
+            drawTilted3DBox(canvas, cx, cy, R, x + c * wxR + rxVec * wyOff, y + s * wxR + ryVec * wyOff, 0.5f + zOffset + rightWheelLift, 3.6f, 1.8f, 3.8f, yaw, roll * 0.5f, wheelCol, wheelCol, wheelCol)
+        }
 
-        // 3. Arka Spoiler (Kanat)
-        if (modelIdx > 0 && !isGhost) {
-            val spX = x - c * 13.0f
-            val spY = y - s * 13.0f
-            draw3DBox(canvas, cx, cy, R, spX, spY, 7.0f, 2.0f, 8.5f, 2.2f, yaw, rearCol, sideCol, rearCol)
+        // 2. Spor Gövde (Yana Yatma Açılı)
+        val bodyLen = if (isPlayer && bumperBroken) 13.5f else 16.0f
+        drawTilted3DBox(canvas, cx, cy, R, x, y, bz, bodyLen, 9.2f, 4.2f, yaw, roll, topCol, sideCol, rearCol)
+
+        // 3. Ön Kaput
+        if (!(isPlayer && bumperBroken)) {
+            val noseX = x + c * 11.5f
+            val noseY = y + s * 11.5f
+            drawTilted3DBox(canvas, cx, cy, R, noseX, noseY, bz + 0.5f, 5.0f, 8.4f, 2.8f, yaw, roll, topCol, sideCol, wheelCol)
+        }
+
+        // 4. Cam Kabin
+        val cabX = x - c * 2.0f
+        val cabY = y - s * 2.0f
+        drawTilted3DBox(canvas, cx, cy, R, cabX, cabY, bz + 4.2f, 7.8f, 7.0f, 3.8f, yaw, roll, topCol, glassCol, glassCol)
+
+        // 5. GT Spoiler
+        if (modelIdx > 0 && !isGhost && !(isPlayer && spoilerBroken)) {
+            val spX = x - c * 14.2f
+            val spY = y - s * 14.2f
+            drawTilted3DBox(canvas, cx, cy, R, spX, spY, bz + 6.5f, 2.2f, 9.8f, 1.2f, yaw, roll, wheelCol, sideCol, rearCol)
+        }
+
+        // 6. Arka Stoplar
+        if (!isGhost) {
+            val tailX = x - c * bodyLen
+            val tailY = y - s * bodyLen
+            val tailCol = if (isPlayer && (reverseGear || speed < -5f)) Color.WHITE else Color.rgb(255, 30, 30)
+            drawTilted3DBox(canvas, cx, cy, R, tailX - rxVec * 5.8f, tailY - ryVec * 5.8f, bz + 2.2f, 0.8f, 2.2f, 1.2f, yaw, roll, tailCol, tailCol, tailCol)
+            drawTilted3DBox(canvas, cx, cy, R, tailX + rxVec * 5.8f, tailY + ryVec * 5.8f, bz + 2.2f, 0.8f, 2.2f, 1.2f, yaw, roll, tailCol, tailCol, tailCol)
         }
     }
 
@@ -565,7 +1115,7 @@ class CrownDriftView(context: Context) : View(context) {
         }
         canvas.drawColor(bgColor)
 
-        // 1. 3B Zemin Kare Izgarası (Grid)
+        // 1. Optimize Edilmiş 3B Zemin Izgarası
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = 1.3f
         paint.color = when (theme) {
@@ -575,12 +1125,12 @@ class CrownDriftView(context: Context) : View(context) {
             3 -> Color.rgb(150, 190, 215)
             else -> Color.rgb(115, 70, 42)
         }
-        val gridStep = 45f
+        val gridStep = 55f
         val baseGX = ((carX / gridStep).toInt()) * gridStep
         val baseGY = ((carY / gridStep).toInt()) * gridStep
-        for (i in -8..8) {
+        for (i in -6..6) {
             val gx = baseGX + i * gridStep
-            for (j in -8..7) {
+            for (j in -6..5) {
                 val gy1 = baseGY + j * gridStep
                 val gy2 = gy1 + gridStep
                 if (project3D(gx, gy1, 0f, cx, cy, R)) {
@@ -591,26 +1141,13 @@ class CrownDriftView(context: Context) : View(context) {
                 }
             }
         }
-        for (j in -8..8) {
-            val gy = baseGY + j * gridStep
-            for (i in -8..7) {
-                val gx1 = baseGX + i * gridStep
-                val gx2 = gx1 + gridStep
-                if (project3D(gx1, gy, 0f, cx, cy, R)) {
-                    val x1 = projX; val y1 = projY
-                    if (project3D(gx2, gy, 0f, cx, cy, R)) {
-                        canvas.drawLine(x1, y1, projX, projY, paint)
-                    }
-                }
-            }
-        }
 
-        // 2. 3B Pist Yolu ve Kırmızı-Beyaz-Sarı Bordürler (İleriden Geriye Doğru Çizim)
+        // 2. 3B Pist Yolu ve Bordürler
         val total = trackPts.size
-        val kerbW = 8.5f
-        val roadCol = if (theme == 3) Color.rgb(75, 90, 105) else Color.rgb(72, 76, 80)
+        val kerbW = 9.5f
+        val roadCol = if (theme == 3) Color.rgb(75, 90, 105) else Color.rgb(70, 74, 78)
 
-        for (step in 52 downTo -10) {
+        for (step in 48 downTo -22) {
             val i0 = (currentWp + step + total) % total
             val i1 = (i0 + 1) % total
             val p0 = trackPts[i0]
@@ -634,25 +1171,22 @@ class CrownDriftView(context: Context) : View(context) {
                 else -> Color.WHITE
             }
 
-            // Sol ve Sağ Bordür Poligonları
             drawQuad3D(canvas, cx, cy, R, kl0x, kl0y, 0f, l0x, l0y, 0f, l1x, l1y, 0f, kl1x, kl1y, 0f, kerbColor)
             drawQuad3D(canvas, cx, cy, R, r0x, r0y, 0f, kr0x, kr0y, 0f, kr1x, kr1y, 0f, r1x, r1y, 0f, kerbColor)
-
-            // Asfalt Poligonu
             drawQuad3D(canvas, cx, cy, R, l0x, l0y, 0f, r0x, r0y, 0f, r1x, r1y, 0f, l1x, l1y, 0f, roadCol)
 
-            // Başlangıç Çizgisi ve 3B Kırmızı Başlangıç Kemeri
             if (i0 == 0) {
                 drawQuad3D(canvas, cx, cy, R, l0x, l0y, 0.3f, r0x, r0y, 0.3f, r1x, r1y, 0.3f, l1x, l1y, 0.3f, Color.WHITE)
-                drawQuad3D(canvas, cx, cy, R, l0x, l0y, 32f, r0x, r0y, 32f, r1x, r1y, 38f, l1x, l1y, 38f, Color.rgb(210, 40, 40))
+                drawQuad3D(canvas, cx, cy, R, l0x, l0y, 34f, r0x, r0y, 34f, r1x, r1y, 40f, l1x, l1y, 40f, Color.rgb(210, 40, 40))
             }
         }
 
-        // 3. Çift Tekerlek Lastik İzleri
+        // 3. Lastik ve Çim İzleri
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = 3.2f
-        paint.color = Color.argb(150, 15, 15, 15)
-        for (mark in tireMarks) {
+        for (mark in tirePool) {
+            if (!mark.active) continue
+            paint.color = mark.color
             if (project3D(mark.lx1, mark.ly1, 0.2f, cx, cy, R)) {
                 val x1 = projX; val y1 = projY
                 if (project3D(mark.lx2, mark.ly2, 0.2f, cx, cy, R)) {
@@ -667,139 +1201,300 @@ class CrownDriftView(context: Context) : View(context) {
             }
         }
 
-        // 4. Yol Kenarı 3B Bina ve Ağaçlar
-        if (theme == 0 || theme == 2) {
-            val sp = trackPts[0]
-            val sn = trackNormals[0]
-            val bldX = sp.x - sn.x * (roadHalfWidth + 55f)
-            val bldY = sp.y - sn.y * (roadHalfWidth + 55f)
-            draw3DBox(canvas, cx, cy, R, bldX, bldY, 0f, 26f, 26f, 45f, 0f, Color.rgb(42, 45, 65), Color.rgb(28, 30, 45), Color.rgb(22, 24, 36))
-
-            val treeX = sp.x + sn.x * (roadHalfWidth + 50f)
-            val treeY = sp.y + sn.y * (roadHalfWidth + 50f)
-            draw3DBox(canvas, cx, cy, R, treeX, treeY, 0f, 16f, 16f, 32f, 0f, Color.rgb(65, 185, 75), Color.rgb(45, 145, 55), Color.rgb(35, 120, 45))
-        }
-
-        // 5. Hayalet Araç (Ghost)
-        if (ghostEnabled && bestLapGhost.isNotEmpty()) {
-            val gPose = bestLapGhost[ghostFrameIdx.coerceAtMost(bestLapGhost.size - 1)]
-            drawTrue3DCar(canvas, cx, cy, R, gPose.x, gPose.y, gPose.yaw, Color.rgb(0, 225, 255), selectedModel, isGhost = true)
-        }
-
-        // 6. Yapay Zeka Bot Araçları
-        if (botsEnabled) {
-            for (bot in bots) {
-                drawTrue3DCar(canvas, cx, cy, R, bot.x, bot.y, bot.yaw, bot.color, 1, isGhost = false)
+        // 4. Çim Üzerindeki 3B Ağaç ve Bina Engelleri (Sadece Yakındakiler Çizilir - 60 FPS)
+        for (obs in obstacles) {
+            val dx = obs.x - carX
+            val dy = obs.y - carY
+            if (dx * dx + dy * dy < 360000f) {
+                if (obs.isTree) {
+                    drawTilted3DBox(canvas, cx, cy, R, obs.x, obs.y, 0f, obs.radius, obs.radius, obs.height, 0f, 0f, Color.rgb(65, 185, 75), Color.rgb(45, 145, 55), Color.rgb(35, 120, 45))
+                } else {
+                    drawTilted3DBox(canvas, cx, cy, R, obs.x, obs.y, 0f, obs.radius, obs.radius, obs.height, 0f, 0f, Color.rgb(45, 50, 70), Color.rgb(28, 32, 48), Color.rgb(22, 25, 38))
+                }
             }
         }
 
-        // 7. Oyuncunun 3B Aracı
-        drawTrue3DCar(canvas, cx, cy, R, carX, carY, carYaw, carColors[selectedColor], selectedModel, isGhost = false)
+        // 5. Kırık Araç Parçaları (Debris)
+        for (d in debrisPool) {
+            if (!d.active) continue
+            drawTilted3DBox(canvas, cx, cy, R, d.x, d.y, d.z, d.size, d.size * 0.7f, d.size * 0.5f, d.yaw, 0f, d.color, d.color, Color.DKGRAY)
+        }
+
+        // 6. Hayalet Araç (Ghost)
+        if (ghostEnabled && bestLapGhost.isNotEmpty()) {
+            val gPose = bestLapGhost[ghostFrameIdx.coerceAtMost(bestLapGhost.size - 1)]
+            drawSport3DCar(canvas, cx, cy, R, gPose.x, gPose.y, 0f, gPose.yaw, gPose.roll, Color.rgb(0, 225, 255), selectedModel, isGhost = true)
+        }
+
+        // 7. 4 Kişilik Co-op Diğer Oyuncuların Araçları
+        for (i in 0..2) {
+            val rp = remotePlayers[i]
+            if (rp.active) {
+                drawSport3DCar(canvas, cx, cy, R, rp.x, rp.y, 0f, rp.yaw, rp.roll, carColors[rp.colorIdx], 2, isGhost = false)
+                if (project3D(rp.x, rp.y, 16f, cx, cy, R)) {
+                    paint.style = Paint.Style.FILL
+                    paint.color = Color.rgb(0, 255, 220)
+                    paint.textSize = R * 0.058f
+                    paint.textAlign = Paint.Align.CENTER
+                    canvas.drawText("P${i + 2}", projX, projY, paint)
+                }
+            }
+        }
+
+        // 8. Yapay Zeka Bot Araçları
+        if (botsEnabled) {
+            for (bot in bots) {
+                drawSport3DCar(canvas, cx, cy, R, bot.x, bot.y, 0f, bot.yaw, 0f, bot.color, 1, isGhost = false)
+            }
+        }
+
+        // 9. Oyuncunun 3B Spor Aracı (Yana Yatma ve Takla Açılı)
+        val activeRoll = if (isCrashing) flipRollAngle else bodyRollAngle
+        drawSport3DCar(canvas, cx, cy, R, carX, carY, carZ, carYaw, activeRoll, carColors[selectedColor], selectedModel, isGhost = false, isPlayer = true)
+
+        // 10. Patlama Alevi, Duman ve Çim Parçacıkları
+        paint.style = Paint.Style.FILL
+        for (p in particlePool) {
+            if (!p.active) continue
+            if (project3D(p.x, p.y, p.z, cx, cy, R)) {
+                paint.color = Color.argb(p.alpha.coerceIn(0, 255), Color.red(p.color), Color.green(p.color), Color.blue(p.color))
+                canvas.drawCircle(projX, projY, (p.size * projScale).coerceAtLeast(1.5f), paint)
+            }
+        }
     }
 
-    // ==================== OYUN FİZİĞİ ====================
+    // ==================== FİZİK: ÇİME ÇIKMA, YANA YATMA VE PATLADIĞI YERDE DOĞMA ====================
     private fun updateBots(dt: Float) {
         val total = trackPts.size
         for (bot in bots) {
-            bot.wpFloat += bot.speedFactor * 17.5f * dt
+            bot.wpFloat += bot.speedFactor * 11.2f * dt
             val idx0 = (bot.wpFloat.toInt() % total + total) % total
             val idx1 = (idx0 + 1) % total
             val frac = bot.wpFloat - floor(bot.wpFloat)
 
             if (abs(bot.laneOffset - bot.targetLane) < 2f) {
-                if ((SystemClock.uptimeMillis() + bot.color) % 120L == 0L) {
+                if ((SystemClock.uptimeMillis() + bot.color) % 140L == 0L) {
                     bot.targetLane = if (bot.targetLane < 0f) 18f else -18f
                 }
             } else {
-                bot.laneOffset += sign(bot.targetLane - bot.laneOffset) * 14f * dt
+                bot.laneOffset += sign(bot.targetLane - bot.laneOffset) * 12f * dt
             }
 
             val p0 = trackPts[idx0]
             val p1 = trackPts[idx1]
             val n0 = trackNormals[idx0]
-            bot.x = p0.x + (p1.x - p0.x) * frac + n0.x * bot.laneOffset
-            bot.y = p0.y + (p1.y - p0.y) * frac + n0.y * bot.laneOffset
+            bot.x = p0.x + (p1.x - p0.x) * frac + n0.x * bot.laneOffset + bot.vx * dt
+            bot.y = p0.y + (p1.y - p0.y) * frac + n0.y * bot.laneOffset + bot.vy * dt
+            bot.vx *= 0.90f
+            bot.vy *= 0.90f
 
             val roadYaw = trackTangents[idx0]
             val nextYaw = trackTangents[(idx0 + 5) % total]
-            bot.yaw = roadYaw + wrapAngle(nextYaw - roadYaw) * 1.35f
+            bot.yaw = roadYaw + wrapAngle(nextYaw - roadYaw) * 1.25f
         }
     }
 
     private fun updateGamePhysics(dt: Float, now: Long) {
         currentLapTime = (now - lapStartTime) / 1000f
+        if (respawnBannerTimer > 0f) respawnBannerTimer -= dt
 
-        if (isTouchingScreen) {
-            steerInput = touchSteer
-            crownSteer = touchSteer
-        } else {
-            crownSteer *= 0.96f
-            steerInput = crownSteer
-        }
-
-        val topSpeed = when (selectedModel) { 0 -> 270f; 1 -> 295f; 2 -> 285f; else -> 315f }
-        val driftGrip = when (selectedModel) { 0 -> 2.4f; 1 -> 2.0f; 2 -> 1.65f; else -> 2.5f }
-        val turnRate = when (sensLevel) { 0 -> 2.5f; 1 -> 3.3f; else -> 4.2f }
-
-        carYaw += steerInput * turnRate * dt
-        val diff = wrapAngle(carYaw - velYaw)
-        velYaw += diff * driftGrip * dt
-        camYaw += wrapAngle(velYaw - camYaw) * 7.2f * dt
-
-        carX += cos(velYaw) * topSpeed * dt
-        carY += sin(velYaw) * topSpeed * dt
-
-        currentLapRecording.add(GhostPose(carX, carY, carYaw))
-        ghostFrameIdx++
-
-        if (botsEnabled) {
-            updateBots(dt)
-            for (bot in bots) {
-                val distToBot = hypot(carX - bot.x, carY - bot.y)
-                if (distToBot < 22f && distToBot > 0.1f) {
-                    val pushAng = atan2(carY - bot.y, carX - bot.x)
-                    carX += cos(pushAng) * (22f - distToBot) * 0.6f
-                    carY += sin(pushAng) * (22f - distToBot) * 0.6f
-                    if (now - lastVibeTime > 70) {
-                        triggerHaptic(35L, 240)
-                        lastVibeTime = now
-                    }
+        // Kırık Parçaların Fiziği
+        for (d in debrisPool) {
+            if (!d.active) continue
+            d.life -= dt
+            if (d.life <= 0f) {
+                d.active = false
+            } else {
+                d.x += d.vx * dt; d.y += d.vy * dt; d.z += d.vz * dt
+                d.vz -= 240f * dt
+                if (d.z < 0.5f) {
+                    d.z = 0.5f; d.vz = -d.vz * 0.45f
+                    d.vx *= 0.75f; d.vy *= 0.75f
                 }
             }
         }
 
-        var bestDist = Float.MAX_VALUE
-        var bestIdx = currentWp
-        val total = trackPts.size
-        for (i in 0 until total) {
-            val d = hypot(carX - trackPts[i].x, carY - trackPts[i].y)
-            if (d < bestDist) {
-                bestDist = d
-                bestIdx = i
+        // Duman / Alev / Çim Parçacıkları
+        if (carDamage > 25f && Random.nextInt(3) == 0) {
+            spawnParticle(carX, carY, carZ + 5f, 0f, 0f, 26f, 3.5f, Color.rgb(65, 65, 70), 155)
+        }
+        for (p in particlePool) {
+            if (!p.active) continue
+            p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt
+            p.size += 5f * dt
+            p.alpha -= (210 * dt).toInt()
+            if (p.alpha <= 0) p.active = false
+        }
+
+        // PATLAMA / DEVRİLME GERİ SAYIMI -> SÜRE BİTİNCE PATLADIĞI YERDE DOĞAR!
+        if (isCrashing) {
+            crashTimer -= dt
+            flipRollAngle += 10.5f * dt
+            carZ += carVZ * dt
+            carVZ -= 235f * dt
+            if (carZ < 0f) {
+                carZ = 0f
+                carVZ = abs(carVZ) * 0.50f
+                triggerHaptic(40L, 230)
+            }
+            carX += cos(velYaw) * speed * dt
+            carY += sin(velYaw) * speed * dt
+            if (crashTimer <= 0f) {
+                respawnAtCrashSpot()
+            }
+            return
+        }
+
+        // Direksiyon Girişi
+        prevSteerInput = steerInput
+        if (isTouchingSteer) {
+            steerInput = touchSteer
+            crownSteer = touchSteer
+        } else {
+            crownSteer *= 0.94f
+            steerInput = crownSteer
+        }
+
+        // Hızlanma + ÇİME ÇIKINCA YAVAŞLAMA FİZİĞİ
+        val baseMaxForward = when (selectedModel) { 0 -> 255f; 1 -> 280f; 2 -> 270f; else -> 300f }
+        val maxForwardSpeed = if (isOffRoad) baseMaxForward * 0.56f else baseMaxForward
+        val maxReverseSpeed = if (isOffRoad) -85f else -135f
+
+        val targetSpeed = when {
+            isBraking -> if (reverseGear) 0f else maxReverseSpeed
+            reverseGear -> maxReverseSpeed
+            else -> maxForwardSpeed
+        }
+        val accelRate = if (isBraking) 360f else if (isOffRoad) 240f else 190f
+        speed += (targetSpeed - speed).coerceIn(-accelRate * dt, accelRate * dt)
+
+        // Serbest 360 Derece Dönüş
+        val turnRate = when (sensLevel) { 0 -> 2.4f; 1 -> 3.2f; else -> 4.1f }
+        val dirSign = if (speed >= -5f) 1f else -1f
+        carYaw += steerInput * turnRate * dirSign * dt
+
+        val driftGrip = if (isOffRoad) 1.35f else when (selectedModel) { 0 -> 2.5f; 1 -> 2.1f; 2 -> 1.7f; else -> 2.6f }
+        val targetVelYaw = if (speed >= 0f) carYaw else wrapAngle(carYaw + PI.toFloat())
+        val diff = wrapAngle(targetVelYaw - velYaw)
+        velYaw += diff * driftGrip * dt
+        camYaw += wrapAngle(carYaw - camYaw) * 6.2f * dt
+
+        val moveSpeed = abs(speed)
+        carX += cos(velYaw) * moveSpeed * dt
+        carY += sin(velYaw) * moveSpeed * dt
+
+        // ANİ VİRAJDA YANA YATMA (İKİ TEKERE KALKMA) VE DEVRİLME HESABI
+        val steerJerk = (steerInput - prevSteerInput) / dt
+        val centrifugal = -steerInput * (moveSpeed / 240f) * 0.58f
+        bodyRollVel += ((centrifugal - bodyRollAngle) * 28f - steerJerk * 0.14f) * dt
+        bodyRollVel *= (1f - 4.2f * dt)
+        bodyRollAngle += bodyRollVel * dt
+
+        // Çok yüksek hızda çok ani kontra yapılırsa araç dengesini kaybedip DEVRİLİR!
+        if (abs(bodyRollAngle) > 0.82f && moveSpeed > 195f) {
+            triggerExplosionOrRollover(isFlip = true)
+            return
+        }
+
+        currentLapRecording.add(GhostPose(carX, carY, carYaw, bodyRollAngle))
+        ghostFrameIdx++
+
+        // Bot Çarpışmaları
+        if (botsEnabled) {
+            updateBots(dt)
+            for (bot in bots) {
+                val dx = carX - bot.x
+                val dy = carY - bot.y
+                val distSq = dx * dx + dy * dy
+                if (distSq < 529f && distSq > 0.01f) {
+                    val dist = sqrt(distSq)
+                    val pushAng = atan2(dy, dx)
+                    val overlap = 23f - dist
+                    carX += cos(pushAng) * overlap * 0.65f
+                    carY += sin(pushAng) * overlap * 0.65f
+                    bot.vx -= cos(pushAng) * 140f
+                    bot.vy -= sin(pushAng) * 140f
+
+                    carDamage = (carDamage + 12f).coerceAtMost(100f)
+                    if (carDamage > 40f) bumperBroken = true
+                    spawnDebris((carX + bot.x) * 0.5f, (carY + bot.y) * 0.5f, 4, carColors[selectedColor])
+                    triggerHaptic(45L, 240)
+                    lastVibeTime = now
+                }
             }
         }
 
-        val maxRoadOffset = roadHalfWidth * 0.80f
-        if (bestDist > maxRoadOffset) {
-            val tp = trackPts[bestIdx]
-            val angToCar = atan2(carY - tp.y, carX - tp.x)
-            carX = tp.x + cos(angToCar) * maxRoadOffset
-            carY = tp.y + sin(angToCar) * maxRoadOffset
+        // Çimdeki 3B Ağaç ve Binalara Çarpma Kontrolü
+        for (obs in obstacles) {
+            val dx = carX - obs.x
+            val dy = carY - obs.y
+            val minD = obs.radius + 11f
+            if (dx * dx + dy * dy < minD * minD) {
+                val ang = atan2(dy, dx)
+                carX = obs.x + cos(ang) * minD
+                carY = obs.y + sin(ang) * minD
+                carDamage += moveSpeed * 0.25f
+                if (carDamage > 35f) bumperBroken = true
+                if (carDamage > 65f) spoilerBroken = true
+                if (moveSpeed > 180f || carDamage >= 100f) {
+                    triggerExplosionOrRollover(isFlip = false)
+                    return
+                } else {
+                    speed = -speed * 0.45f
+                    spawnDebris(carX, carY, 6, carColors[selectedColor])
+                    triggerHaptic(80L, 255)
+                }
+            }
+        }
 
-            val tangentYaw = trackTangents[bestIdx]
-            velYaw += wrapAngle(tangentYaw - velYaw) * 8.0f * dt
-            carYaw += wrapAngle(tangentYaw - carYaw) * 4.5f * dt
+        // En Yakın Pist Noktasını Bulma (Optimize Edilmiş)
+        var bestDistSq = Float.MAX_VALUE
+        var bestIdx = currentWp
+        val total = trackPts.size
+        for (i in 0 until total) {
+            val dx = carX - trackPts[i].x
+            val dy = carY - trackPts[i].y
+            val dSq = dx * dx + dy * dy
+            if (dSq < bestDistSq) {
+                bestDistSq = dSq
+                bestIdx = i
+            }
+        }
+        val bestDist = sqrt(bestDistSq)
 
-            if (now - lastVibeTime > 55) {
-                triggerHaptic(32L, 255)
+        // Bordür Üzerinden Geçerken Zıplama / Yana Eğim Etkisi
+        if (bestDist in (roadHalfWidth - 6f)..(roadHalfWidth + 8f) && moveSpeed > 120f) {
+            bodyRollVel += sign(steerInput) * 2.2f * dt
+        }
+
+        // PİST DIŞINA (ÇİMLERE) ÇIKMA KONTROLÜ
+        isOffRoad = bestDist > roadHalfWidth + 4f
+        if (isOffRoad && moveSpeed > 45f) {
+            if (Random.nextInt(2) == 0) {
+                // Çim ve Toprak Parçacıkları Fırlat
+                spawnParticle(carX - cos(carYaw) * 12f, carY - sin(carYaw) * 12f, 2f, Random.nextFloat() * 20f - 10f, Random.nextFloat() * 20f - 10f, 35f, 3.0f, Color.rgb(65, 130, 40), 210)
+            }
+            if (now - lastVibeTime > 95) {
+                triggerHaptic(14L, 95) // Çim arazi titreşimi
                 lastVibeTime = now
             }
         }
 
+        // Çok Uzak Dış Sınır Güvenlik Çiti (Pistten 4.5 Kat Uzaklaşınca)
+        val outerFence = roadHalfWidth * 4.5f
+        if (bestDist > outerFence) {
+            val tp = trackPts[bestIdx]
+            val angToCar = atan2(carY - tp.y, carX - tp.x)
+            carX = tp.x + cos(angToCar) * outerFence
+            carY = tp.y + sin(angToCar) * outerFence
+            speed *= 0.6f
+        }
+
+        // Tur Sayacı
         if (bestIdx > maxWpReached && bestIdx - maxWpReached < total / 3) {
             maxWpReached = bestIdx
         }
-        if (bestIdx < total / 8 && maxWpReached > (total * 3) / 4) {
+        if (bestIdx < total / 10 && maxWpReached > (total * 3) / 4) {
             maxWpReached = 0
             if (currentLapTime < bestLapTime || bestLapGhost.isEmpty()) {
                 bestLapTime = currentLapTime
@@ -834,35 +1529,42 @@ class CrownDriftView(context: Context) : View(context) {
         }
         racePosition = pos
 
+        // Drift Puanlama ve Tekerlek İzi (Asfaltta Siyah, Çimde Kahverengi Çamur İzi)
         val slip = abs(wrapAngle(carYaw - velYaw))
         val backX = carX - cos(carYaw) * 12f
         val backY = carY - sin(carYaw) * 12f
-        val perpX = -sin(carYaw) * 6.5f
-        val perpY = cos(carYaw) * 6.5f
+        val perpX = -sin(carYaw) * 7.0f
+        val perpY = cos(carYaw) * 7.0f
         val curLX = backX - perpX; val curLY = backY - perpY
         val curRX = backX + perpX; val curRY = backY + perpY
 
-        if (slip > 0.10f) {
-            driftTimer += dt
-            driftCombo = when {
-                driftTimer > 3.2f -> 4
-                driftTimer > 1.6f -> 3
-                driftTimer > 0.5f -> 2
-                else -> 1
+        if ((slip > 0.12f || isOffRoad) && moveSpeed > 70f && !reverseGear) {
+            if (!isOffRoad) {
+                driftTimer += dt
+                driftCombo = when {
+                    driftTimer > 3.0f -> 4
+                    driftTimer > 1.5f -> 3
+                    driftTimer > 0.4f -> 2
+                    else -> 1
+                }
+                score += slip * 540f * driftCombo * dt
             }
-            score += slip * 520f * driftCombo * dt
 
-            if (hasPrevSkid && hypot(curLX - prevBackLX, curLY - prevBackLY) < 35f) {
-                tireMarks.add(TireMark(prevBackLX, prevBackLY, curLX, curLY, prevBackRX, prevBackRY, curRX, curRY))
-                if (tireMarks.size > 140) tireMarks.removeAt(0)
+            if (hasPrevSkid && hypot(curLX - prevBackLX, curLY - prevBackLY) < 40f) {
+                val tm = tirePool[tireHead]
+                tireHead = (tireHead + 1) % tirePool.size
+                tm.active = true
+                tm.lx1 = prevBackLX; tm.ly1 = prevBackLY; tm.lx2 = curLX; tm.ly2 = curLY
+                tm.rx1 = prevBackRX; tm.ry1 = prevBackRY; tm.rx2 = curRX; tm.ry2 = curRY
+                tm.color = if (isOffRoad) Color.argb(165, 65, 45, 25) else Color.argb(160, 15, 15, 15)
             }
             prevBackLX = curLX; prevBackLY = curLY
             prevBackRX = curRX; prevBackRY = curRY
             hasPrevSkid = true
 
-            if (now - lastVibeTime > 60) {
-                val amp = (slip * 260f).toInt().coerceIn(95, 255)
-                triggerHaptic(32L, amp)
+            if (!isOffRoad && now - lastVibeTime > 60) {
+                val amp = (slip * 255f).toInt().coerceIn(90, 255)
+                triggerHaptic(26L, amp)
                 lastVibeTime = now
             }
         } else {
@@ -872,13 +1574,187 @@ class CrownDriftView(context: Context) : View(context) {
         }
     }
 
-    // ==================== MENÜLER VE ARAYÜZ ====================
+    // ==================== OYUN İÇİ HUD VE 4 KİŞİLİK MİNİ HARİTA ====================
+    private fun drawGameHud(canvas: Canvas, cx: Float, cy: Float, R: Float) {
+        tempRect.set(cx - R * 0.44f, cy - R * 0.84f, cx + R * 0.28f, cy - R * 0.44f)
+        paint.style = Paint.Style.FILL
+        paint.color = Color.argb(180, 14, 20, 26)
+        canvas.drawRoundRect(tempRect, R * 0.08f, R * 0.08f, paint)
+
+        paint.color = Color.rgb(190, 200, 210)
+        paint.textAlign = Paint.Align.CENTER
+        paint.textSize = R * 0.068f
+        val timeStr = String.format("%.1fs", currentLapTime)
+        val posStr = if (botsEnabled) " • $racePosition/3" else ""
+        canvas.drawText("LAP $lap/$totalLaps • $timeStr$posStr", tempRect.centerX(), cy - R * 0.69f, paint)
+
+        paint.color = if (isOffRoad) Color.rgb(255, 195, 30) else Color.rgb(0, 225, 255)
+        paint.textSize = R * 0.145f
+        canvas.drawText("${score.toInt()}", tempRect.centerX() - (if (driftCombo > 1) R * 0.07f else 0f), cy - R * 0.50f, paint)
+
+        if (driftCombo > 1) {
+            val multLeft = tempRect.right - R * 0.22f
+            val multRight = tempRect.right - R * 0.04f
+            tempRect.set(multLeft, cy - R * 0.62f, multRight, cy - R * 0.49f)
+            paint.color = Color.rgb(235, 45, 115)
+            canvas.drawRoundRect(tempRect, R * 0.05f, R * 0.05f, paint)
+            paint.color = Color.WHITE
+            paint.textSize = R * 0.072f
+            canvas.drawText("x$driftCombo", tempRect.centerX(), tempRect.centerY() + R * 0.025f, paint)
+        }
+
+        // SAĞ ÜST MİNİ HARİTA (4 Co-op Oyuncu + Botlar)
+        val mapCX = cx + R * 0.54f
+        val mapCY = cy - R * 0.42f
+        val mapRad = R * 0.23f
+        paint.style = Paint.Style.FILL
+        paint.color = Color.argb(175, 12, 18, 24)
+        canvas.drawCircle(mapCX, mapCY, mapRad, paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 2f
+        paint.color = Color.argb(120, 0, 225, 255)
+        canvas.drawCircle(mapCX, mapCY, mapRad, paint)
+
+        val miniScale = mapRad / 1850f
+        miniPath.reset()
+        for (i in trackPts.indices step 3) {
+            val mx = mapCX + trackPts[i].x * miniScale
+            val my = mapCY + trackPts[i].y * miniScale
+            if (i == 0) miniPath.moveTo(mx, my) else miniPath.lineTo(mx, my)
+        }
+        miniPath.close()
+        paint.strokeWidth = 3.0f
+        paint.color = Color.rgb(120, 135, 150)
+        canvas.drawPath(miniPath, paint)
+
+        paint.style = Paint.Style.FILL
+        if (botsEnabled) {
+            for (bot in bots) {
+                paint.color = bot.color
+                canvas.drawCircle(mapCX + bot.x * miniScale, mapCY + bot.y * miniScale, R * 0.020f, paint)
+            }
+        }
+        // Co-op Diğer Oyuncular (Turkuaz Noktalar)
+        for (rp in remotePlayers) {
+            if (rp.active) {
+                paint.color = Color.rgb(0, 255, 220)
+                canvas.drawCircle(mapCX + rp.x * miniScale, mapCY + rp.y * miniScale, R * 0.028f, paint)
+            }
+        }
+        // Oyuncu Noktası (Yeşil)
+        paint.color = Color.rgb(60, 255, 90)
+        canvas.drawCircle(mapCX + carX * miniScale, mapCY + carY * miniScale, R * 0.030f, paint)
+
+        // Sol Alt D/R Vites ve Sağ Alt Fren
+        val gearBtnX = cx - R * 0.55f
+        val gearBtnY = cy + R * 0.48f
+        paint.color = if (reverseGear) Color.rgb(235, 55, 55) else Color.argb(185, 25, 35, 45)
+        canvas.drawCircle(gearBtnX, gearBtnY, R * 0.15f, paint)
+        paint.color = Color.WHITE
+        paint.textSize = R * 0.095f
+        paint.textAlign = Paint.Align.CENTER
+        canvas.drawText(if (reverseGear) "R" else "D", gearBtnX, gearBtnY + R * 0.035f, paint)
+
+        val brakeBtnX = cx + R * 0.55f
+        val brakeBtnY = cy + R * 0.48f
+        paint.color = if (isBraking) Color.rgb(255, 140, 20) else Color.argb(185, 25, 35, 45)
+        canvas.drawCircle(brakeBtnX, brakeBtnY, R * 0.15f, paint)
+        paint.color = Color.WHITE
+        paint.textSize = R * 0.068f
+        canvas.drawText("FREN", brakeBtnX, brakeBtnY + R * 0.025f, paint)
+
+        // Patlama / Çim / Yeniden Doğma Bildirimleri
+        if (isCrashing) {
+            paint.color = Color.rgb(255, 65, 55)
+            paint.textSize = R * 0.095f
+            val secStr = String.format("%.1fs", crashTimer.coerceAtLeast(0f))
+            canvas.drawText("DEVRİLDİ! $secStr", cx, cy - R * 0.12f, paint)
+        } else if (respawnBannerTimer > 0f) {
+            paint.color = Color.rgb(80, 255, 140)
+            paint.textSize = R * 0.085f
+            canvas.drawText("OLDUĞU YERDE DOĞDU", cx, cy - R * 0.12f, paint)
+        } else if (isOffRoad) {
+            paint.color = Color.rgb(255, 205, 40)
+            paint.textSize = R * 0.072f
+            canvas.drawText("ÇİM ALAN (YAVAŞ)", cx, cy - R * 0.18f, paint)
+        }
+
+        // Alt Kenar 19 Noktalı Direksiyon Göstergesi
+        val totalDots = 19
+        val centerDot = totalDots / 2
+        val activeDotOffset = (steerInput * centerDot).toInt().coerceIn(-centerDot, centerDot)
+        for (i in 0 until totalDots) {
+            val offset = i - centerDot
+            val deg = 90f - offset * 3.4f
+            val rad = Math.toRadians(deg.toDouble())
+            val dx = cx + cos(rad).toFloat() * (R * 0.88f)
+            val dy = cy + sin(rad).toFloat() * (R * 0.88f)
+
+            val isLit = (activeDotOffset >= 0 && offset in 0..activeDotOffset) ||
+                        (activeDotOffset < 0 && offset in activeDotOffset..0) || offset == 0
+            paint.color = if (isLit) Color.rgb(0, 225, 255) else Color.argb(135, 70, 80, 90)
+            canvas.drawCircle(dx, dy, R * 0.018f, paint)
+        }
+    }
+
+    // ==================== 5. 4 KİŞİLİK CO-OP ODA (LOBBY) EKRANI ====================
+    private fun drawCoopLobby(canvas: Canvas, cx: Float, cy: Float, R: Float) {
+        canvas.drawColor(Color.rgb(10, 14, 18))
+        paint.style = Paint.Style.FILL
+        paint.textAlign = Paint.Align.CENTER
+        paint.color = Color.rgb(0, 225, 255)
+        paint.textSize = R * 0.115f
+        canvas.drawText("CO-OP ODA (4 KİŞİ)", cx, cy - R * 0.56f, paint)
+
+        // ODA KUR (HOST) & ODAYA KATIL (CLIENT) Butonları
+        tempRect.set(cx - R * 0.68f, cy - R * 0.42f, cx - R * 0.04f, cy - R * 0.16f)
+        paint.color = if (lobbyRole == 1) Color.rgb(0, 225, 255) else Color.rgb(26, 34, 44)
+        canvas.drawRoundRect(tempRect, R * 0.08f, R * 0.08f, paint)
+        paint.color = if (lobbyRole == 1) Color.BLACK else Color.WHITE
+        paint.textSize = R * 0.072f
+        canvas.drawText("ODA KUR", tempRect.centerX(), tempRect.centerY() + R * 0.025f, paint)
+
+        tempRect.set(cx + R * 0.04f, cy - R * 0.42f, cx + R * 0.68f, cy - R * 0.16f)
+        paint.color = if (lobbyRole == 2) Color.rgb(0, 225, 255) else Color.rgb(26, 34, 44)
+        canvas.drawRoundRect(tempRect, R * 0.08f, R * 0.08f, paint)
+        paint.color = if (lobbyRole == 2) Color.BLACK else Color.WHITE
+        canvas.drawText("KATIL", tempRect.centerX(), tempRect.centerY() + R * 0.025f, paint)
+
+        // Bağlantı Durumu ve 4 Oyuncu Slotu
+        paint.color = Color.rgb(255, 205, 40)
+        paint.textSize = R * 0.068f
+        canvas.drawText(lobbyStatusText, cx, cy - R * 0.04f, paint)
+
+        for (i in 0..3) {
+            val sy = cy + R * (0.08f + i * 0.09f)
+            val isOccupied = if (i == 0) true else remotePlayers[i - 1].active
+            val slotName = if (i == 0) "1. SEN (${if (lobbyRole == 2) "Katilimci" else "Kurucu"})"
+                           else "${i + 1}. ${if (isOccupied) remotePlayers[i - 1].name else "Bekleniyor..."}"
+            paint.color = if (isOccupied) Color.rgb(75, 245, 130) else Color.rgb(110, 120, 135)
+            paint.textSize = R * 0.064f
+            canvas.drawText(slotName, cx, sy, paint)
+        }
+
+        // YARIŞI BAŞLAT (Host için aktif)
+        tempRect.set(cx - R * 0.46f, cy + R * 0.44f, cx + R * 0.46f, cy + R * 0.68f)
+        paint.color = if (lobbyRole == 2) Color.rgb(45, 55, 65) else Color.rgb(0, 225, 255)
+        canvas.drawRoundRect(tempRect, R * 0.12f, R * 0.12f, paint)
+        paint.color = if (lobbyRole == 2) Color.LTGRAY else Color.BLACK
+        paint.textSize = R * 0.090f
+        canvas.drawText(if (lobbyRole == 2) "HOST BEKLENİYOR" else "BAŞLAT (START)", cx, tempRect.centerY() + R * 0.03f, paint)
+
+        paint.color = Color.rgb(160, 175, 190)
+        paint.textSize = R * 0.075f
+        canvas.drawText("GERİ", cx, cy + R * 0.82f, paint)
+    }
+
+    // ==================== ANA MENÜ, GARAJ VE AYARLAR ====================
     private fun drawMainMenu(canvas: Canvas, cx: Float, cy: Float, R: Float) {
         canvas.drawColor(Color.rgb(10, 14, 18))
 
-        val arcPath = Path()
-        val arcRect = RectF(cx - R * 0.76f, cy - R * 0.76f, cx + R * 0.76f, cy + R * 0.76f)
-        arcPath.addArc(arcRect, 222f, 96f)
+        arcPath.reset()
+        tempRect.set(cx - R * 0.76f, cy - R * 0.76f, cx + R * 0.76f, cy + R * 0.76f)
+        arcPath.addArc(tempRect, 222f, 96f)
         paint.style = Paint.Style.FILL
         paint.color = Color.rgb(190, 200, 210)
         paint.textSize = R * 0.095f
@@ -888,79 +1764,61 @@ class CrownDriftView(context: Context) : View(context) {
         canvas.drawTextOnPath("CROWNDRIFT", arcPath, 0f, 0f, paint)
         paint.letterSpacing = 0f
 
-        val mapScale = R * 0.00036f
-        val mapPath = Path()
-        val yellowPath = Path()
+        val mapScale = R * 0.00016f
+        miniPath.reset()
         val total = trackPts.size
         for (i in 0 until total) {
             val px = cx + trackPts[i].x * mapScale
-            val py = cy - R * 0.14f + trackPts[i].y * mapScale
-            if (i == 0) mapPath.moveTo(px, py) else mapPath.lineTo(px, py)
-            if (i in (total / 6)..(total / 3)) {
-                if (i == total / 6) yellowPath.moveTo(px, py) else yellowPath.lineTo(px, py)
-            }
+            val py = cy - R * 0.16f + trackPts[i].y * mapScale
+            if (i == 0) miniPath.moveTo(px, py) else miniPath.lineTo(px, py)
         }
-        mapPath.close()
+        miniPath.close()
 
         paint.style = Paint.Style.STROKE
         paint.strokeCap = Paint.Cap.ROUND
-        paint.strokeWidth = R * 0.045f
+        paint.strokeWidth = R * 0.042f
         paint.color = if (tracks[currentTrackIdx].theme == 1) Color.rgb(0, 225, 255) else Color.WHITE
-        canvas.drawPath(mapPath, paint)
-        paint.color = Color.rgb(255, 195, 20)
-        canvas.drawPath(yellowPath, paint)
+        canvas.drawPath(miniPath, paint)
 
         paint.style = Paint.Style.FILL
         paint.color = Color.rgb(150, 160, 175)
         paint.textSize = R * 0.14f
-        canvas.drawText("<", cx - R * 0.68f, cy - R * 0.08f, paint)
-        canvas.drawText(">", cx + R * 0.68f, cy - R * 0.08f, paint)
+        canvas.drawText("<", cx - R * 0.68f, cy - R * 0.10f, paint)
+        canvas.drawText(">", cx + R * 0.68f, cy - R * 0.10f, paint)
 
         paint.color = Color.WHITE
-        paint.textSize = R * 0.15f
-        canvas.drawText(tracks[currentTrackIdx].name, cx, cy + R * 0.25f, paint)
+        paint.textSize = R * 0.13f
+        canvas.drawText(tracks[currentTrackIdx].name, cx, cy + R * 0.22f, paint)
 
-        for (i in tracks.indices) {
-            val dotX = cx + (i - (tracks.size - 1) / 2f) * (R * 0.08f)
-            val dotY = cy + R * 0.32f
-            if (i == currentTrackIdx) {
-                paint.color = Color.rgb(0, 220, 255)
-                canvas.drawRoundRect(dotX - R * 0.035f, dotY - R * 0.015f, dotX + R * 0.035f, dotY + R * 0.015f, 8f, 8f, paint)
-            } else {
-                paint.color = Color.rgb(50, 60, 70)
-                canvas.drawCircle(dotX, dotY, R * 0.014f, paint)
-            }
-        }
+        // 4 Kişilik CO-OP ODA Butonu
+        tempRect.set(cx - R * 0.34f, cy + R * 0.32f, cx + R * 0.34f, cy + R * 0.48f)
+        paint.color = Color.rgb(25, 42, 55)
+        canvas.drawRoundRect(tempRect, R * 0.08f, R * 0.08f, paint)
+        paint.color = Color.rgb(0, 240, 220)
+        paint.textSize = R * 0.072f
+        canvas.drawText("CO-OP ODA (4P)", cx, tempRect.centerY() + R * 0.025f, paint)
 
-        val bestScore = prefs.getInt("best_score_$currentTrackIdx", 0)
-        paint.color = Color.rgb(25, 32, 40)
-        val badgeRect = RectF(cx - R * 0.24f, cy + R * 0.37f, cx + R * 0.24f, cy + R * 0.49f)
-        canvas.drawRoundRect(badgeRect, R * 0.06f, R * 0.06f, paint)
-        paint.color = Color.WHITE
-        paint.textSize = R * 0.085f
-        canvas.drawText("● $bestScore", cx, cy + R * 0.46f, paint)
-
-        val gx = cx - R * 0.56f
-        val gy = cy + R * 0.34f
+        val gx = cx - R * 0.60f
+        val gy = cy + R * 0.32f
         paint.color = Color.rgb(28, 36, 44)
-        canvas.drawCircle(gx, gy, R * 0.15f, paint)
+        canvas.drawCircle(gx, gy, R * 0.14f, paint)
         paint.color = Color.WHITE
         canvas.drawRoundRect(gx - R * 0.055f, gy - R * 0.04f, gx + R * 0.055f, gy + R * 0.04f, 6f, 6f, paint)
 
-        val sx = cx + R * 0.56f
-        val sy = cy + R * 0.34f
+        val sx = cx + R * 0.60f
+        val sy = cy + R * 0.32f
         paint.color = Color.rgb(28, 36, 44)
-        canvas.drawCircle(sx, sy, R * 0.15f, paint)
+        canvas.drawCircle(sx, sy, R * 0.14f, paint)
         paint.color = Color.WHITE
-        paint.textSize = R * 0.13f
-        canvas.drawText("⚙", sx, sy + R * 0.045f, paint)
+        paint.textSize = R * 0.12f
+        canvas.drawText("⚙", sx, sy + R * 0.04f, paint)
 
         paint.color = Color.rgb(0, 225, 255)
-        val startRect = RectF(cx - R * 0.46f, cy + R * 0.53f, cx + R * 0.46f, cy + R * 0.79f)
-        canvas.drawRoundRect(startRect, R * 0.13f, R * 0.13f, paint)
+        tempRect.set(cx - R * 0.46f, cy + R * 0.54f, cx + R * 0.46f, cy + R * 0.79f)
+        canvas.drawRoundRect(tempRect, R * 0.13f, R * 0.13f, paint)
         paint.color = Color.rgb(10, 20, 28)
-        paint.textSize = R * 0.13f
-        canvas.drawText("START", cx, cy + R * 0.70f, paint)
+        paint.textSize = R * 0.125f
+        canvas.drawText("START", cx, cy + R * 0.71f, paint)
     }
 
     private fun drawGarage(canvas: Canvas, cx: Float, cy: Float, R: Float) {
@@ -975,34 +1833,30 @@ class CrownDriftView(context: Context) : View(context) {
         canvas.translate(cx, cy - R * 0.28f)
         val bodyColor = carColors[selectedColor]
         paint.color = Color.rgb(20, 20, 20)
-        canvas.drawRoundRect(-R * 0.24f, R * 0.02f, -R * 0.12f, R * 0.13f, 8f, 8f, paint)
-        canvas.drawRoundRect(R * 0.06f, R * 0.05f, R * 0.18f, R * 0.16f, 8f, 8f, paint)
+        canvas.drawRoundRect(-R * 0.25f, R * 0.02f, -R * 0.12f, R * 0.14f, 8f, 8f, paint)
+        canvas.drawRoundRect(R * 0.08f, R * 0.04f, R * 0.21f, R * 0.15f, 8f, 8f, paint)
         paint.color = bodyColor
-        canvas.drawRoundRect(-R * 0.30f, -R * 0.06f, R * 0.30f, R * 0.09f, 12f, 12f, paint)
-        paint.color = Color.rgb(140, 225, 255)
-        canvas.drawRoundRect(-R * 0.14f, -R * 0.16f, R * 0.14f, -R * 0.04f, 8f, 8f, paint)
-        paint.color = bodyColor
-        canvas.drawRoundRect(-R * 0.12f, -R * 0.18f, R * 0.08f, -R * 0.12f, 6f, 6f, paint)
+        canvas.drawRoundRect(-R * 0.32f, -R * 0.05f, R * 0.32f, R * 0.09f, 12f, 12f, paint)
+        paint.color = Color.rgb(40, 55, 70)
+        canvas.drawRoundRect(-R * 0.14f, -R * 0.15f, R * 0.15f, -R * 0.03f, 8f, 8f, paint)
         if (selectedModel > 0) {
-            canvas.drawRect(-R * 0.28f, -R * 0.16f, -R * 0.20f, -R * 0.06f, paint)
-            canvas.drawRoundRect(-R * 0.32f, -R * 0.19f, -R * 0.16f, -R * 0.14f, 4f, 4f, paint)
+            paint.color = bodyColor
+            canvas.drawRoundRect(-R * 0.34f, -R * 0.18f, -R * 0.18f, -R * 0.12f, 4f, 4f, paint)
         }
-        paint.color = Color.WHITE
-        canvas.drawRect(R * 0.22f, -R * 0.02f, R * 0.29f, R * 0.04f, paint)
         canvas.restore()
 
-        val leftRect = RectF(cx - R * 0.56f, cy - R * 0.07f, cx - R * 0.04f, cy + R * 0.11f)
-        val rightRect = RectF(cx + R * 0.04f, cy - R * 0.07f, cx + R * 0.56f, cy + R * 0.11f)
+        tempRect.set(cx - R * 0.56f, cy - R * 0.07f, cx - R * 0.04f, cy + R * 0.11f)
         paint.color = Color.rgb(0, 225, 255)
-        canvas.drawRoundRect(leftRect, R * 0.09f, R * 0.09f, paint)
+        canvas.drawRoundRect(tempRect, R * 0.09f, R * 0.09f, paint)
         paint.color = Color.BLACK
-        paint.textSize = R * 0.085f
-        canvas.drawText(carModels[selectedModel], leftRect.centerX(), leftRect.centerY() + R * 0.03f, paint)
+        paint.textSize = R * 0.082f
+        canvas.drawText(carModels[selectedModel], tempRect.centerX(), tempRect.centerY() + R * 0.03f, paint)
 
+        tempRect.set(cx + R * 0.04f, cy - R * 0.07f, cx + R * 0.56f, cy + R * 0.11f)
         paint.color = Color.rgb(24, 30, 38)
-        canvas.drawRoundRect(rightRect, R * 0.09f, R * 0.09f, paint)
+        canvas.drawRoundRect(tempRect, R * 0.09f, R * 0.09f, paint)
         paint.color = Color.WHITE
-        canvas.drawText(carModels[(selectedModel + 1) % carModels.size], rightRect.centerX(), rightRect.centerY() + R * 0.03f, paint)
+        canvas.drawText(carModels[(selectedModel + 1) % carModels.size], tempRect.centerX(), tempRect.centerY() + R * 0.03f, paint)
 
         for (i in 0 until 8) {
             val row = i / 4
@@ -1030,91 +1884,48 @@ class CrownDriftView(context: Context) : View(context) {
         val sensNames = arrayOf("LOW", "MEDIUM", "HIGH")
 
         drawSettingRow(canvas, cx, cy - R * 0.52f, R, 0.64f, "SENS", sensNames[sensLevel], false)
-        drawSettingRow(canvas, cx, cy - R * 0.24f, R, 0.76f, "GFX", if (gfxHigh) "HIGH" else "LOW", false)
+        drawSettingRow(canvas, cx, cy - R * 0.24f, R, 0.76f, "CO-OP ODA", "AC", false)
         drawSettingRow(canvas, cx, cy + R * 0.04f, R, 0.76f, "GHOST", "", ghostEnabled)
         drawSettingRow(canvas, cx, cy + R * 0.32f, R, 0.68f, "AI BOTS", "", botsEnabled)
 
-        val fpsRect = RectF(cx - R * 0.48f, cy + R * 0.50f, cx - R * 0.03f, cy + R * 0.70f)
-        val backRect = RectF(cx + R * 0.03f, cy + R * 0.50f, cx + R * 0.48f, cy + R * 0.70f)
+        tempRect.set(cx - R * 0.48f, cy + R * 0.50f, cx - R * 0.03f, cy + R * 0.70f)
         paint.color = Color.rgb(22, 28, 36)
-        canvas.drawRoundRect(fpsRect, R * 0.1f, R * 0.1f, paint)
-        canvas.drawRoundRect(backRect, R * 0.1f, R * 0.1f, paint)
-
+        canvas.drawRoundRect(tempRect, R * 0.1f, R * 0.1f, paint)
         paint.color = if (showFps) Color.rgb(0, 225, 255) else Color.WHITE
         paint.textAlign = Paint.Align.CENTER
         paint.textSize = R * 0.075f
-        canvas.drawText("SHOW FPS", fpsRect.centerX(), fpsRect.centerY() + R * 0.025f, paint)
+        canvas.drawText("SHOW FPS", tempRect.centerX(), tempRect.centerY() + R * 0.025f, paint)
+
+        tempRect.set(cx + R * 0.03f, cy + R * 0.50f, cx + R * 0.48f, cy + R * 0.70f)
+        paint.color = Color.rgb(22, 28, 36)
+        canvas.drawRoundRect(tempRect, R * 0.1f, R * 0.1f, paint)
         paint.color = Color.WHITE
-        canvas.drawText("BACK", backRect.centerX(), backRect.centerY() + R * 0.025f, paint)
+        canvas.drawText("BACK", tempRect.centerX(), tempRect.centerY() + R * 0.025f, paint)
     }
 
     private fun drawSettingRow(canvas: Canvas, cx: Float, y: Float, R: Float, wRatio: Float, label: String, valueText: String, toggleVal: Boolean) {
-        val rect = RectF(cx - R * wRatio, y - R * 0.11f, cx + R * wRatio, y + R * 0.11f)
+        tempRect.set(cx - R * wRatio, y - R * 0.11f, cx + R * wRatio, y + R * 0.11f)
         paint.style = Paint.Style.FILL
         paint.color = Color.rgb(20, 26, 34)
-        canvas.drawRoundRect(rect, R * 0.11f, R * 0.11f, paint)
+        canvas.drawRoundRect(tempRect, R * 0.11f, R * 0.11f, paint)
 
         paint.color = Color.WHITE
-        paint.textSize = R * 0.082f
+        paint.textSize = R * 0.080f
         paint.textAlign = Paint.Align.LEFT
-        canvas.drawText(label, rect.left + R * 0.10f, y + R * 0.03f, paint)
+        canvas.drawText(label, tempRect.left + R * 0.10f, y + R * 0.03f, paint)
 
         if (valueText.isNotEmpty()) {
             paint.color = Color.rgb(0, 200, 230)
             paint.textAlign = Paint.Align.RIGHT
-            canvas.drawText(valueText, rect.right - R * 0.10f, y + R * 0.03f, paint)
+            canvas.drawText(valueText, tempRect.right - R * 0.10f, y + R * 0.03f, paint)
         } else {
-            val swRight = rect.right - R * 0.08f
+            val swRight = tempRect.right - R * 0.08f
             val swLeft = swRight - R * 0.20f
             paint.color = if (toggleVal) Color.rgb(0, 180, 215) else Color.rgb(45, 55, 65)
             canvas.drawRoundRect(swLeft, y - R * 0.055f, swRight, y + R * 0.055f, R * 0.055f, R * 0.055f, paint)
             paint.color = Color.WHITE
             val knobX = if (toggleVal) swRight - R * 0.055f else swLeft + R * 0.055f
             canvas.drawCircle(knobX, y, R * 0.042f, paint)
-        }
-    }
-
-    private fun drawGameHud(canvas: Canvas, cx: Float, cy: Float, R: Float) {
-        val hudRect = RectF(cx - R * 0.48f, cy - R * 0.82f, cx + R * 0.48f, cy - R * 0.40f)
-        paint.style = Paint.Style.FILL
-        paint.color = Color.argb(180, 16, 22, 28)
-        canvas.drawRoundRect(hudRect, R * 0.09f, R * 0.09f, paint)
-
-        paint.color = Color.rgb(190, 200, 210)
-        paint.textAlign = Paint.Align.CENTER
-        paint.textSize = R * 0.076f
-        val timeStr = String.format("%.1fs", currentLapTime)
-        val posStr = if (botsEnabled) " • POS $racePosition/3" else ""
-        canvas.drawText("LAP $lap/$totalLaps • $timeStr$posStr", cx, cy - R * 0.66f, paint)
-
-        paint.color = Color.rgb(0, 225, 255)
-        paint.textSize = R * 0.165f
-        val scoreOffsetX = if (driftCombo > 1) -R * 0.09f else 0f
-        canvas.drawText("${score.toInt()}", cx + scoreOffsetX, cy - R * 0.46f, paint)
-
-        if (driftCombo > 1) {
-            val multRect = RectF(cx + R * 0.14f, cy - R * 0.59f, cx + R * 0.34f, cy - R * 0.45f)
-            paint.color = Color.rgb(235, 45, 115)
-            canvas.drawRoundRect(multRect, R * 0.06f, R * 0.06f, paint)
-            paint.color = Color.WHITE
-            paint.textSize = R * 0.085f
-            canvas.drawText("x$driftCombo", multRect.centerX(), multRect.centerY() + R * 0.03f, paint)
-        }
-
-        val totalDots = 19
-        val centerDot = totalDots / 2
-        val activeDotOffset = (steerInput * centerDot).toInt().coerceIn(-centerDot, centerDot)
-        for (i in 0 until totalDots) {
-            val offset = i - centerDot
-            val deg = 90f - offset * 3.4f
-            val rad = Math.toRadians(deg.toDouble())
-            val dx = cx + cos(rad).toFloat() * (R * 0.88f)
-            val dy = cy + sin(rad).toFloat() * (R * 0.88f)
-
-            val isLit = (activeDotOffset >= 0 && offset in 0..activeDotOffset) ||
-                        (activeDotOffset < 0 && offset in activeDotOffset..0) || offset == 0
-            paint.color = if (isLit) Color.rgb(0, 225, 255) else Color.argb(135, 70, 80, 90)
-            canvas.drawCircle(dx, dy, R * 0.018f, paint)
         }
     }
 
@@ -1129,12 +1940,12 @@ class CrownDriftView(context: Context) : View(context) {
         canvas.drawText(winTitle, cx, cy - R * 0.52f, paint)
 
         if (isNewRecord) {
-            val recRect = RectF(cx - R * 0.36f, cy - R * 0.45f, cx + R * 0.36f, cy - R * 0.32f)
+            tempRect.set(cx - R * 0.36f, cy - R * 0.45f, cx + R * 0.36f, cy - R * 0.32f)
             paint.color = Color.rgb(245, 190, 25)
-            canvas.drawRoundRect(recRect, R * 0.065f, R * 0.065f, paint)
+            canvas.drawRoundRect(tempRect, R * 0.065f, R * 0.065f, paint)
             paint.color = Color.rgb(20, 20, 20)
             paint.textSize = R * 0.075f
-            canvas.drawText("NEW RECORD!", cx, recRect.centerY() + R * 0.026f, paint)
+            canvas.drawText("NEW RECORD!", cx, tempRect.centerY() + R * 0.026f, paint)
         }
 
         val finalScore = score.toInt()
@@ -1142,40 +1953,18 @@ class CrownDriftView(context: Context) : View(context) {
         paint.textSize = R * 0.25f
         canvas.drawText("$finalScore", cx, cy - R * 0.08f, paint)
 
-        paint.color = Color.rgb(150, 165, 175)
-        paint.textSize = R * 0.075f
-        canvas.drawText("SCORE", cx, cy + R * 0.01f, paint)
-
         val goldReq = tracks[currentTrackIdx].goldScore
-        val medals = intArrayOf(Color.rgb(215, 135, 65), Color.rgb(210, 215, 220), Color.rgb(250, 200, 30))
-        val reqs = intArrayOf((goldReq * 0.5f).toInt(), (goldReq * 0.75f).toInt(), goldReq)
-        for (i in 0..2) {
-            val mx = cx + (i - 1) * (R * 0.13f)
-            val my = cy + R * 0.09f
-            if (finalScore >= reqs[i]) {
-                paint.style = Paint.Style.FILL
-                paint.color = medals[i]
-                canvas.drawCircle(mx, my, R * 0.038f, paint)
-            } else {
-                paint.style = Paint.Style.STROKE
-                paint.strokeWidth = 3f
-                paint.color = medals[i]
-                canvas.drawCircle(mx, my, R * 0.035f, paint)
-            }
-        }
-
-        paint.style = Paint.Style.FILL
         paint.color = Color.rgb(175, 185, 195)
         paint.textSize = R * 0.07f
         val bestStr = String.format("%.2fs", bestLapTime)
         canvas.drawText("GOLD $goldReq • BEST LAP $bestStr", cx, cy + R * 0.20f, paint)
 
-        val resRect = RectF(cx - R * 0.48f, cy + R * 0.26f, cx + R * 0.48f, cy + R * 0.52f)
+        tempRect.set(cx - R * 0.48f, cy + R * 0.26f, cx + R * 0.48f, cy + R * 0.52f)
         paint.color = Color.rgb(0, 225, 255)
-        canvas.drawRoundRect(resRect, R * 0.13f, R * 0.13f, paint)
+        canvas.drawRoundRect(tempRect, R * 0.13f, R * 0.13f, paint)
         paint.color = Color.rgb(10, 20, 28)
         paint.textSize = R * 0.11f
-        canvas.drawText("RESTART", cx, resRect.centerY() + R * 0.04f, paint)
+        canvas.drawText("RESTART", cx, tempRect.centerY() + R * 0.04f, paint)
 
         paint.color = Color.rgb(160, 175, 190)
         paint.textSize = R * 0.085f
