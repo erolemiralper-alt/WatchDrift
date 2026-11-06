@@ -85,20 +85,23 @@ data class RemotePlayer(
     var modelIdx: Int = 1
 )
 
-// Oyuncuyla Birebir Aynı Fizik Kurallarını Kullanan Gelişmiş AI Bot Sınıfı
 class BotCar(
     val id: Int,
     val color: Int,
     val modelIdx: Int,
-    val skillProfile: Float // 0.96f .. 1.03f arası rekabetçi profil
+    val skillProfile: Float
 ) {
     var x = 0f
     var y = 0f
     var z = 0f
+    var vz = 0f
     var yaw = 0f
     var velYaw = 0f
     var speed = 0f
     var steerInput = 0f
+    var vx = 0f
+    var vy = 0f
+
     var currentWp = 0
     var maxWpReached = 0
     var lap = 1
@@ -112,6 +115,7 @@ class BotCar(
     var damage = 0f
     var isCrashing = false
     var crashTimer = 0f
+    var flipRoll = 0f
     var shieldTimer = 0f
     var spinTimer = 0f
     var slowTimer = 0f
@@ -127,7 +131,8 @@ data class Obstacle3D(
     val isTree: Boolean,
     val isRoadBarrier: Boolean = false,
     var wpIdx: Int = 0,
-    var active: Boolean = true
+    var active: Boolean = true,
+    var respawnTimer: Float = 0f
 )
 
 class PowerUpBox {
@@ -148,15 +153,6 @@ class Missile3D {
     var life = 0f
     var targetBotIdx = -1
     var isBullet = false
-}
-
-class SpikeTrap3D {
-    var active = false
-    var x = 0f
-    var y = 0f
-    var yaw = 0f
-    var life = 0f
-    var ignorePlayerTimer = 0f
 }
 
 class DebrisPart {
@@ -188,7 +184,7 @@ data class TrackData(
 )
 
 class CrownDriftView(context: Context) : View(context) {
-    private val prefs = context.getSharedPreferences("crowndrift_v8", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences("crowndrift_v9", Context.MODE_PRIVATE)
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val boldTypeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
     private val polyPath = Path()
@@ -267,7 +263,7 @@ class CrownDriftView(context: Context) : View(context) {
     private val roadHalfWidth = 58f
     private var dynamicBarrierShiftTimer = 0f
 
-    // Oyuncu Fizik Değişkenleri
+    // Oyuncu Fizik Değişkenleri (Eski Çarpışma Tepkisi ve İvme Vektörleri Dahil)
     private var carX = 0f
     private var carY = 0f
     private var carZ = 0f
@@ -275,6 +271,8 @@ class CrownDriftView(context: Context) : View(context) {
     private var carYaw = 0f
     private var velYaw = 0f
     private var speed = 0f
+    private var knockVX = 0f
+    private var knockVY = 0f
     private var camYaw = 0f
     private var isOffRoad = false
 
@@ -288,44 +286,46 @@ class CrownDriftView(context: Context) : View(context) {
     private var countdownTimer = 0f
     private var lastCountdownBeep = 4
 
-    // Hasar, Güvenli Doğma ve 3 Saniye Kalkan Sistemi
-    private var carDamage = 0f
+    // Eski Kademeli Hasar, Alev Alma, Takla Atma ve Güvenli Doğma Sistemi
+    private var carDamage = 0f // 0..100 (Sadece 100 olunca patlar!)
     private var spoilerBroken = false
     private var bumperBroken = false
     private var isCrashing = false
     private var crashTimer = 0f
-    private var shieldTimer = 0f // 3 Saniyelik Koruma Kalkanı
-    private var playerSpinTimer = 0f
+    private var flipRollAngle = 0f // Patladığında / devrildiğinde 3B takla açısı
+    private var impactTiltAngle = 0f // Çarpışma anında fiziksel sarsıntı eğimi
+    private var shieldTimer = 0f
+    private var respawnBannerTimer = 0f
     private var playerSlowTimer = 0f
 
     // Turbo Sistemi
-    private var turboMeter = 0f // 0..100
+    private var turboMeter = 0f
     private var turboActiveTimer = 0f
 
     // Güç Kutuları ve Silah Sistemi
-    // 0=Yok, 1=FÜZE (Missile), 2=TUZAK (Spike Trap), 3=YAVAŞLATMA (EMP Slow), 4=ÖN SİLAH (Gatling Taret)
+    // 0=Yok, 1=FÜZE (Missile), 2=ŞOK DALGASI (Sonic Shockwave & Onarım), 3=YAVAŞLATMA (EMP Slow), 4=ÖN SİLAH (Taret)
     private var activeWeaponType = 0
     private var weaponTimer = 0f
     private var weaponMaxTimer = 1f
     private var weaponAmmo = 0
     private var weaponFireCooldown = 0f
+    private var shockwaveRadius = 0f // Görsel 3B Şok Dalgası Çemberi
 
-    // Önceden Ayrılmış Nesne Havuzları (Sıfır Bellek Tahsisi / Isınma Önleyici)
+    // Önceden Ayrılmış Nesne Havuzları (Object Pooling)
     private val powerUpPool = Array(8) { PowerUpBox() }
     private val missilePool = Array(8) { Missile3D() }
-    private val spikePool = Array(6) { SpikeTrap3D() }
-    private val debrisPool = Array(20) { DebrisPart() }
+    private val debrisPool = Array(28) { DebrisPart() }
     private var debrisHead = 0
-    private val particlePool = Array(24) { Particle3D() }
+    private val particlePool = Array(32) { Particle3D() }
     private var particleHead = 0
-    private val tirePool = Array(85) { TireMark() }
+    private val tirePool = Array(95) { TireMark() }
     private var tireHead = 0
 
     private var prevBackLX = 0f; private var prevBackLY = 0f
     private var prevBackRX = 0f; private var prevBackRY = 0f
     private var hasPrevSkid = false
 
-    // Yarış ve Sıralama Bilgileri
+    // Yarış Bilgileri
     private var lap = 1
     private val totalLaps = 3
     private var currentWp = 0
@@ -341,7 +341,6 @@ class CrownDriftView(context: Context) : View(context) {
     private var driftTimer = 0f
     private var isNewRecord = false
 
-    // Hayalet Araç ve 3 Rekabetçi AI Bot (Toplam 4 Araç)
     private val currentLapRecording = ArrayList<GhostPose>(900)
     private var bestLapGhost = listOf<GhostPose>()
     private var ghostFrameIdx = 0
@@ -376,7 +375,6 @@ class CrownDriftView(context: Context) : View(context) {
     }
     private var receiverRegistered = false
 
-    // 3B Projeksiyon Değişkenleri (Her Karede Yeniden Hesaplanır)
     private var camCosYaw = 1f
     private var camSinYaw = 0f
     private var projX = 0f
@@ -731,7 +729,6 @@ class CrownDriftView(context: Context) : View(context) {
         return super.onGenericMotionEvent(event)
     }
 
-    // ==================== PİST, SABİT/DİNAMİK ENGELLER VE GÜÇ KUTULARI OLUŞTURMA ====================
     private fun buildTrackSpline(idx: Int) {
         trackPts.clear()
         trackNormals.clear()
@@ -740,7 +737,7 @@ class CrownDriftView(context: Context) : View(context) {
 
         val cps = tracks[idx].controlPoints
         val n = cps.size
-        val stepsPerSeg = 22
+        val stepsPerSeg = 24
         for (i in 0 until n) {
             val p0 = cps[(i - 1 + n) % n]
             val p1 = cps[i]
@@ -771,8 +768,8 @@ class CrownDriftView(context: Context) : View(context) {
             trackNormals.add(Vec2(nx, ny))
             trackTangents.add(atan2(dy, dx))
 
-            // 1. Çim Üzerindeki Sabit Ağaç ve Bina Engelleri (Başlangıç çizgisi civarı hariç)
-            if (i > 12 && i % 16 == 0) {
+            // 1. Çim Üzerindeki Sabit Ağaç ve Bina Engelleri
+            if (i > 14 && i % 16 == 0) {
                 val side = if ((i / 16) % 2 == 0) 1f else -1f
                 val distFromRoad = roadHalfWidth + 68f + (i % 30)
                 val ox = trackPts[i].x + nx * side * distFromRoad
@@ -781,16 +778,16 @@ class CrownDriftView(context: Context) : View(context) {
                 obstacles.add(Obstacle3D(ox, oy, if (isTree) 15f else 24f, if (isTree) 32f else 46f, isTree, isRoadBarrier = false, wpIdx = i))
             }
 
-            // 2. Yol Üzerindeki Adil Bariyer Engelleri (Kaçış Boşluğu Bırakılmış)
-            if (i > 25 && i % 38 == 0) {
-                val laneSide = if ((i / 38) % 2 == 0) -22f else 22f
+            // 2. Kırılabilir / Parçalanabilir Yol Bariyer Engelleri (Asla anında patlatmaz!)
+            if (i > 28 && i % 40 == 0) {
+                val laneSide = if ((i / 40) % 2 == 0) -22f else 22f
                 val bx = trackPts[i].x + nx * laneSide
                 val by = trackPts[i].y + ny * laneSide
-                obstacles.add(Obstacle3D(bx, by, 10.5f, 12f, isTree = false, isRoadBarrier = true, wpIdx = i))
+                obstacles.add(Obstacle3D(bx, by, 10.5f, 11f, isTree = false, isRoadBarrier = true, wpIdx = i, active = true))
             }
         }
 
-        // 3. Yol Üzerinde Rastgele Güç Kutuları (Power-Up Boxes)
+        // 3. Rastgele Güç Kutuları
         for (k in powerUpPool.indices) {
             val wp = ((k + 1) * (total / (powerUpPool.size + 1))) % total
             val lane = when (k % 3) { 0 -> -18f; 1 -> 18f; else -> 0f }
@@ -804,23 +801,24 @@ class CrownDriftView(context: Context) : View(context) {
         }
     }
 
-    // ==================== 4 ARAÇ YAN YANA TURNUVA BAŞLANGICI (3, 2, 1, BAŞLA!) ====================
+    // ==================== ESKİ BAŞLANGIÇ DÜZENİ GERİ GETİRİLDİ ====================
     private fun startRace(fromNetwork: Boolean = false) {
         buildTrackSpline(currentTrackIdx)
         val p0 = trackPts[0]
         val n0 = trackNormals[0]
-        val startYaw = trackTangents[0]
 
-        // 4 Araç Aynı Başlangıç Çizgisinde Yan Yana (-27, -9, +9, +27)
-        val laneOffsets = floatArrayOf(-27f, -9f, 9f, 27f)
-        carX = p0.x + n0.x * laneOffsets[0]
-        carY = p0.y + n0.y * laneOffsets[0]
+        // Oyuncu önceki sürümdeki gibi başlangıç çizgisinin merkezinde başlar
+        val startOffset = if (lobbyRole == 2) 16f else if (lobbyRole == 1) -16f else 0f
+        carX = p0.x + n0.x * startOffset
+        carY = p0.y + n0.y * startOffset
         carZ = 0f
         carVZ = 0f
-        carYaw = startYaw
-        velYaw = startYaw
-        camYaw = startYaw
-        speed = 0f // Geri sayım bitene kadar 0
+        carYaw = trackTangents[0]
+        velYaw = carYaw
+        camYaw = carYaw
+        speed = 0f
+        knockVX = 0f
+        knockVY = 0f
         isOffRoad = false
 
         isFullStopped = false
@@ -828,7 +826,7 @@ class CrownDriftView(context: Context) : View(context) {
         crownSteer = 0f
         isBezelDragging = false
 
-        // 3, 2, 1 Turnuva Geri Sayımı Başlat
+        // 3, 2, 1 Turnuva Geri Sayımı
         countdownTimer = 3.4f
         lastCountdownBeep = 4
 
@@ -837,8 +835,10 @@ class CrownDriftView(context: Context) : View(context) {
         bumperBroken = false
         isCrashing = false
         crashTimer = 0f
+        flipRollAngle = 0f
+        impactTiltAngle = 0f
         shieldTimer = 0f
-        playerSpinTimer = 0f
+        respawnBannerTimer = 0f
         playerSlowTimer = 0f
 
         turboMeter = 0f
@@ -847,9 +847,9 @@ class CrownDriftView(context: Context) : View(context) {
         weaponTimer = 0f
         weaponAmmo = 0
         weaponFireCooldown = 0f
+        shockwaveRadius = 0f
 
         for (m in missilePool) m.active = false
-        for (sp in spikePool) sp.active = false
         for (d in debrisPool) d.active = false
         for (p in particlePool) p.active = false
         for (tm in tirePool) tm.active = false
@@ -857,28 +857,32 @@ class CrownDriftView(context: Context) : View(context) {
         currentLapRecording.clear()
         ghostFrameIdx = 0
 
-        // 3 Rekabetçi AI Botu Diğer 3 Başlangıç Şeridine Yerleştir (Toplam 4 Araç Yan Yana)
+        // Botlar Eski Sürümdeki Gibi Kademeli (wp = 4, wp = 8) ve Sağlı-Sollu Başlar!
         bots.clear()
         if (botsEnabled) {
+            val startWps = intArrayOf(4, 8, 12)
+            val startLanes = floatArrayOf(-18f, 18f, -18f)
             val botColors = intArrayOf(Color.rgb(255, 195, 20), Color.rgb(235, 45, 90), Color.rgb(55, 215, 95))
-            val skills = floatArrayOf(0.97f, 1.00f, 1.02f)
+            val skills = floatArrayOf(0.96f, 0.99f, 1.02f)
+
             for (bIdx in 0..2) {
+                val wp = startWps[bIdx]
+                val lane = startLanes[bIdx]
                 val bot = BotCar(
                     id = bIdx,
                     color = botColors[bIdx],
                     modelIdx = (selectedModel + bIdx + 1) % 4,
                     skillProfile = skills[bIdx]
                 )
-                val lane = laneOffsets[bIdx + 1]
-                bot.x = p0.x + n0.x * lane
-                bot.y = p0.y + n0.y * lane
-                bot.yaw = startYaw
-                bot.velYaw = startYaw
+                bot.x = trackPts[wp].x + trackNormals[wp].x * lane
+                bot.y = trackPts[wp].y + trackNormals[wp].y * lane
+                bot.yaw = trackTangents[wp]
+                bot.velYaw = bot.yaw
                 bot.speed = 0f
                 bot.preferredLane = lane
                 bot.targetLane = lane
-                bot.currentWp = 0
-                bot.maxWpReached = 0
+                bot.currentWp = wp
+                bot.maxWpReached = wp
                 bot.lap = 1
                 bots.add(bot)
             }
@@ -901,12 +905,11 @@ class CrownDriftView(context: Context) : View(context) {
         requestFocus()
     }
 
-    // ==================== HIZLI YEREL YOL ARAMA (ISINMA ÖNLEYİCİ %94 CPU TASARRUFU) ====================
     private fun findNearestWaypointLocal(x: Float, y: Float, hintWp: Int): Int {
         val total = trackPts.size
         var bestDistSq = Float.MAX_VALUE
         var bestIdx = hintWp
-        for (offset in -8..14) {
+        for (offset in -10..16) {
             val idx = (hintWp + offset + total) % total
             val dx = x - trackPts[idx].x
             val dy = y - trackPts[idx].y
@@ -916,7 +919,6 @@ class CrownDriftView(context: Context) : View(context) {
                 bestIdx = idx
             }
         }
-        // Eğer araç çok uzağa savrulduysa tek seferlik tam tarama yap
         if (bestDistSq > 95000f) {
             for (i in 0 until total step 2) {
                 val dx = x - trackPts[i].x
@@ -931,38 +933,65 @@ class CrownDriftView(context: Context) : View(context) {
         return bestIdx
     }
 
-    // ==================== GÜVENLİ YOL NOKTASINDA YENİDEN DOĞMA VE 3 SANİYE KALKAN ====================
-    private fun triggerPlayerExplosion() {
+    // ==================== ESKİ HASAR, PARÇALANMA, ALEV VE TAKLA MEKANİĞİ ====================
+    private fun applyGradualCarDamage(amount: Float, impactX: Float, impactY: Float) {
+        if (shieldTimer > 0f || isCrashing) return
+        val prevDamage = carDamage
+        carDamage = (carDamage + amount).coerceAtMost(100f)
+
+        // %35 Hasarda Ön Tampon Kopup Yere Düşer
+        if (prevDamage <= 35f && carDamage > 35f) {
+            bumperBroken = true
+            spawnDebris(carX + cos(carYaw) * 14f, carY + sin(carYaw) * 14f, 6, carColors[selectedColor])
+        }
+        // %65 Hasarda Arka Spoiler Kırılıp Yere Düşer
+        if (prevDamage <= 65f && carDamage > 65f) {
+            spoilerBroken = true
+            spawnDebris(carX - cos(carYaw) * 14f, carY - sin(carYaw) * 14f, 6, carColors[selectedColor])
+        }
+        // Normal çarpışma parçaları
+        spawnDebris(impactX, impactY, 4, carColors[selectedColor])
+
+        // SADECE HASAR %100'E ULAŞTIĞINDA ARAÇ PATLAR VE TAKLA ATAR!
+        if (carDamage >= 100f) {
+            triggerExplosionAndRollover()
+        }
+    }
+
+    private fun triggerExplosionAndRollover() {
         if (isCrashing || shieldTimer > 0f) return
         isCrashing = true
-        crashTimer = 1.6f
-        carVZ = 135f
-        speed = 0f
+        crashTimer = 1.85f
+        flipRollAngle = 0f
+        carVZ = 145f
+        speed *= 0.35f
 
-        spawnDebris(carX, carY, 8, carColors[selectedColor])
-        for (i in 0 until 8) {
+        spawnDebris(carX, carY, 12, carColors[selectedColor])
+        for (i in 0 until 12) {
             val ang = Random.nextFloat() * 6.28f
-            val spd = 25f + Random.nextFloat() * 55f
+            val spd = 25f + Random.nextFloat() * 60f
             val fireCol = if (i % 2 == 0) Color.rgb(255, 110, 20) else Color.rgb(255, 210, 40)
-            spawnParticle(carX, carY, 5f, cos(ang) * spd, sin(ang) * spd, 40f + Random.nextFloat() * 45f, 5.0f, fireCol, 235)
+            spawnParticle(carX, carY, 5f, cos(ang) * spd, sin(ang) * spd, 45f + Random.nextFloat() * 50f, 5.5f, fireCol, 240)
         }
-        triggerHaptic(170L, 255)
+        triggerHaptic(180L, 255)
     }
 
     private fun respawnPlayerOnSafeRoad() {
         isCrashing = false
+        flipRollAngle = 0f
+        impactTiltAngle = 0f
         carZ = 0f
         carVZ = 0f
         carDamage = 0f
         spoilerBroken = false
         bumperBroken = false
-        playerSpinTimer = 0f
         playerSlowTimer = 0f
+        knockVX = 0f
+        knockVY = 0f
 
-        // En yakın GÜVENLİ yol noktasını bul (Bina ve yol bariyeri olmayan temiz asfalt merkezi)
         val total = trackPts.size
         var safeWp = findNearestWaypointLocal(carX, carY, currentWp)
-        for (step in 0..6) {
+        for (step in 0..8) {
             val candidate = (safeWp + step) % total
             val cp = trackPts[candidate]
             var blocked = false
@@ -970,7 +999,7 @@ class CrownDriftView(context: Context) : View(context) {
                 if (!obs.active) continue
                 val dx = cp.x - obs.x
                 val dy = cp.y - obs.y
-                if (dx * dx + dy * dy < (obs.radius + 22f) * (obs.radius + 22f)) {
+                if (dx * dx + dy * dy < (obs.radius + 24f) * (obs.radius + 24f)) {
                     blocked = true
                     break
                 }
@@ -991,12 +1020,13 @@ class CrownDriftView(context: Context) : View(context) {
         speed = 95f
         isFullStopped = false
 
-        // 3 Saniyelik Koruma Kalkanı Aktif!
+        // 3 Saniyelik Yeniden Doğma Koruma Kalkanı
         shieldTimer = 3.0f
-        triggerHaptic(50L, 200)
+        respawnBannerTimer = 1.5f
+        triggerHaptic(55L, 200)
     }
 
-    // ==================== GÜÇ KUTUSU SİLAHLARI VE TURBO AKTİVASYONU ====================
+    // ==================== TURBO VE YENİ GÜÇ KUTUSU SİSTEMİ (ŞOK DALGASI DAHİL) ====================
     private fun activateTurbo() {
         if (turboMeter < 100f || turboActiveTimer > 0f || countdownTimer > 0f) return
         turboMeter = 0f
@@ -1005,26 +1035,24 @@ class CrownDriftView(context: Context) : View(context) {
     }
 
     private fun giveRandomPowerUp() {
-        // Yeni kutu alındığında önceki silahla çakışmaması için temiz şekilde üzerine yazar
-        val type = Random.nextInt(1, 5) // 1=FÜZE, 2=DİKENLİ TUZAK, 3=YAVAŞLATMA, 4=ÖN SİLAH (TARET)
+        // 1 = FÜZE, 2 = ŞOK DALGASI (Dikenli Tuzak Yerine!), 3 = YAVAŞLATMA, 4 = ÖN TARET SİLAHI
+        val type = Random.nextInt(1, 5)
         activeWeaponType = type
         when (type) {
             1 -> {
-                // A) FÜZE SİSTEMİ (Önde 2 Güdümlü Füze)
                 weaponAmmo = 2
                 weaponMaxTimer = 10f
                 weaponTimer = 10f
                 weaponFireCooldown = 0.4f
             }
             2 -> {
-                // B) DİKENLİ TUZAK (Aracın Arkasına Bırakılır)
+                // YENİ ÖZELLİK: SONİK ŞOK DALGASI & ONARIM (2 Kullanım Hakkı, 8 Saniye Süre)
                 weaponAmmo = 2
-                weaponMaxTimer = 7f
-                weaponTimer = 7f
-                deploySpikeTrap()
+                weaponMaxTimer = 8.0f
+                weaponTimer = 8.0f
+                triggerShockwavePulse() // İlk şok dalgasını anında yayar ve hasarı %30 onarır!
             }
             3 -> {
-                // C) YAVAŞLATMA ÖZELLİĞİ (Rakipleri Geçici Yavaşlatır)
                 weaponAmmo = 1
                 weaponMaxTimer = 5.0f
                 weaponTimer = 5.0f
@@ -1034,7 +1062,6 @@ class CrownDriftView(context: Context) : View(context) {
                 spawnParticle(carX, carY, 8f, 0f, 0f, 20f, 14f, Color.rgb(0, 210, 255), 220)
             }
             4 -> {
-                // D) ARAÇ ÖNÜ SİLAHI (Kaput Üstü Çift Namlulu Taret)
                 weaponAmmo = 12
                 weaponMaxTimer = 6.5f
                 weaponTimer = 6.5f
@@ -1044,26 +1071,64 @@ class CrownDriftView(context: Context) : View(context) {
         triggerHaptic(45L, 230)
     }
 
-    private fun deploySpikeTrap() {
+    // Dikenli Tuzak Yerine Gelen Stratejik ŞOK DALGASI (Sonic Shockwave)
+    private fun triggerShockwavePulse() {
         if (weaponAmmo <= 0) return
-        for (sp in spikePool) {
-            if (!sp.active) {
-                sp.active = true
-                sp.x = carX - cos(carYaw) * 20f
-                sp.y = carY - sin(carYaw) * 20f
-                sp.yaw = carYaw
-                sp.life = 14f
-                sp.ignorePlayerTimer = 1.5f
-                weaponAmmo--
-                if (weaponAmmo <= 0 && activeWeaponType == 2) {
-                    weaponTimer = 1.2f
-                }
-                break
+        weaponAmmo--
+        shockwaveRadius = 12f
+        // Aracın hasarını %30 onarır
+        carDamage = (carDamage - 30f).coerceAtLeast(0f)
+        if (carDamage < 35f) bumperBroken = false
+        if (carDamage < 65f) spoilerBroken = false
+
+        // Yakındaki Rakip Araçları Savurur ve Yavaşlatır
+        for (bot in bots) {
+            if (bot.isCrashing) continue
+            val dx = bot.x - carX
+            val dy = bot.y - carY
+            val dSq = dx * dx + dy * dy
+            if (dSq < 18500f && dSq > 1f) {
+                val pushAng = atan2(dy, dx)
+                bot.vx += cos(pushAng) * 210f
+                bot.vy += sin(pushAng) * 210f
+                bot.spinTimer = 0.9f
+                bot.speed *= 0.55f
             }
+        }
+
+        // Yakındaki Kırılabilir Yol Bariyerlerini Parçalayarak Yolu Açar!
+        for (obs in obstacles) {
+            if (obs.active && obs.isRoadBarrier) {
+                val dx = obs.x - carX
+                val dy = obs.y - carY
+                if (dx * dx + dy * dy < 22500f) {
+                    obs.active = false
+                    obs.respawnTimer = 14f
+                    spawnDebris(obs.x, obs.y, 7, Color.rgb(255, 125, 20))
+                }
+            }
+        }
+
+        triggerHaptic(55L, 250)
+        if (weaponAmmo <= 0 && activeWeaponType == 2) {
+            weaponTimer = 1.0f
         }
     }
 
     private fun tryAutoFireWeapon(dt: Float) {
+        if (activeWeaponType == 2 && weaponAmmo > 0) {
+            // Şok dalgası hazırken rakip çok yaklaşırsa otomatik ikinci dalgayı patlatır
+            for (bot in bots) {
+                val dx = bot.x - carX
+                val dy = bot.y - carY
+                if (dx * dx + dy * dy < 6400f && shockwaveRadius <= 0f) {
+                    triggerShockwavePulse()
+                    break
+                }
+            }
+            return
+        }
+
         if (activeWeaponType != 1 && activeWeaponType != 4) return
         if (weaponAmmo <= 0) {
             activeWeaponType = 0
@@ -1073,9 +1138,8 @@ class CrownDriftView(context: Context) : View(context) {
         weaponFireCooldown -= dt
         if (weaponFireCooldown > 0f) return
 
-        // Rakip Araç Oyuncunun Görüş Açısına ve Atış Doğrultusuna Girdi mi Kontrol Et
         val maxRangeSq = if (activeWeaponType == 1) 115000f else 75000f
-        val minCosCone = if (activeWeaponType == 1) 0.90f else 0.86f // ~25 derece ön koni
+        val minCosCone = if (activeWeaponType == 1) 0.90f else 0.86f
         val fwdX = cos(carYaw)
         val fwdY = sin(carYaw)
 
@@ -1127,16 +1191,16 @@ class CrownDriftView(context: Context) : View(context) {
             val d = debrisPool[debrisHead]
             debrisHead = (debrisHead + 1) % debrisPool.size
             val ang = Random.nextFloat() * 6.28f
-            val spd = 35f + Random.nextFloat() * 85f
+            val spd = 38f + Random.nextFloat() * 90f
             d.active = true
             d.x = ix; d.y = iy; d.z = 4f + Random.nextFloat() * 5f
             d.vx = cos(ang) * spd
             d.vy = sin(ang) * spd
-            d.vz = 60f + Random.nextFloat() * 80f
+            d.vz = 65f + Random.nextFloat() * 85f
             d.yaw = ang
-            d.size = 2.6f + Random.nextFloat() * 2.6f
-            d.color = if (i % 2 == 0) baseCol else Color.rgb(40, 40, 45)
-            d.life = 3.5f
+            d.size = 2.7f + Random.nextFloat() * 2.8f
+            d.color = if (i % 2 == 0) baseCol else Color.rgb(220, 225, 230)
+            d.life = 4.2f
         }
     }
 
@@ -1222,13 +1286,10 @@ class CrownDriftView(context: Context) : View(context) {
             }
 
             3 -> {
-                // 1. İç Bölgedeki Güvenli ÇIKIŞ Butonu
                 val exitBtnX = cx + R * 0.08f
                 val exitBtnY = cy - R * 0.42f
-                // 2. SOL-ALT İÇ BÖLGE DUR / SÜR BUTONU (Arabanın Üzerinden Kaldırıldı!)
                 val stopBtnX = cx - R * 0.44f
                 val stopBtnY = cy + R * 0.28f
-                // 3. SAĞ-ALT İÇ BÖLGE TURBO BUTONU
                 val turboBtnX = cx + R * 0.44f
                 val turboBtnY = cy + R * 0.22f
 
@@ -1250,8 +1311,7 @@ class CrownDriftView(context: Context) : View(context) {
                             if (turboMeter >= 100f) {
                                 activateTurbo()
                             } else if (activeWeaponType == 2 && weaponAmmo > 0) {
-                                deploySpikeTrap()
-                                vibeClick()
+                                triggerShockwavePulse()
                             }
                             return true
                         }
@@ -1328,7 +1388,6 @@ class CrownDriftView(context: Context) : View(context) {
             canvas.drawText("$currentFps FPS", cx, cy - R * 0.87f, paint)
         }
 
-        // Pil ve Isınma Optimizasyonu: İşlemciye kareler arası nefes aldıran akıcı tetikleme
         if (state == 3 || state == 1) {
             postInvalidateOnAnimation()
         } else {
@@ -1336,19 +1395,20 @@ class CrownDriftView(context: Context) : View(context) {
         }
     }
 
-    // ==================== OPTIMIZE EDİLMİŞ 3B PERSPEKTİF MOTORU ====================
+    // ==================== ARKADAKİ YOLUN KAYBOLMASINI ÖNLEYEN 3B KAMERA PROJEKSİYONU ====================
     private fun project3D(wx: Float, wy: Float, wz: Float, cx: Float, cy: Float, R: Float): Boolean {
         val dx = wx - carX
         val dy = wy - carY
 
         val forward = dx * camCosYaw + dy * camSinYaw
-        if (forward < -85f || forward > 1150f) return false
         val right = -dx * camSinYaw + dy * camCosYaw
 
+        // Kamera aracın 98 birim gerisinde ve 138 birim yukarıda;
+        // Aracın arkasındaki yolun silinmemesi için forward kısıtlaması kaldırıldı, depth < 8f yapıldı!
         val relF = forward + 98f
         val relH = wz - 138f
         val depth = relF * 0.682f - relH * 0.731f
-        if (depth < 16f) return false
+        if (depth < 8f || depth > 1450f) return false
         val vert = relF * 0.731f + relH * 0.682f
 
         val fov = R * 1.48f
@@ -1387,39 +1447,48 @@ class CrownDriftView(context: Context) : View(context) {
         canvas.drawPath(polyPath, paint)
     }
 
-    private fun draw3DBox(
+    // Çarpışma Sarsıntısı ve Patlama Taklası Destekli 3B Kutu Çizici
+    private fun drawTilted3DBox(
         canvas: Canvas, cx: Float, cy: Float, R: Float,
         bx: Float, by: Float, bz: Float,
         halfL: Float, halfW: Float, height: Float,
-        yaw: Float, topColor: Int, sideColor: Int, rearColor: Int
+        yaw: Float, roll: Float,
+        topColor: Int, sideColor: Int, rearColor: Int
     ) {
         val dx = bx - carX
         val dy = by - carY
         val fwd = dx * camCosYaw + dy * camSinYaw
-        if (fwd < -65f || fwd > 1050f) return
+        if (fwd < -115f || fwd > 1100f) return
 
         val c = cos(yaw)
         val s = sin(yaw)
         val fx = c * halfL; val fy = s * halfL
         val rx = -s * halfW; val ry = c * halfW
 
+        val sinR = sin(roll)
+        val leftLift = (-sinR * halfW).coerceAtLeast(-bz)
+        val rightLift = (sinR * halfW).coerceAtLeast(-bz)
+
         val flX = bx + fx - rx; val flY = by + fy - ry
         val frX = bx + fx + rx; val frY = by + fy + ry
         val rrX = bx - fx + rx; val rrY = by - fy + ry
         val rlX = bx - fx - rx; val rlY = by - fy - ry
-        val topZ = bz + height
 
-        drawQuad3D(canvas, cx, cy, R, flX, flY, bz, rlX, rlY, bz, rlX, rlY, topZ, flX, flY, topZ, sideColor)
-        drawQuad3D(canvas, cx, cy, R, frX, frY, bz, rrX, rrY, bz, rrX, rrY, topZ, frX, frY, topZ, sideColor)
-        drawQuad3D(canvas, cx, cy, R, flX, flY, bz, frX, frY, bz, frX, frY, topZ, flX, flY, topZ, sideColor)
-        drawQuad3D(canvas, cx, cy, R, rlX, rlY, bz, rrX, rrY, bz, rrX, rrY, topZ, rlX, rlY, topZ, rearColor)
-        drawQuad3D(canvas, cx, cy, R, flX, flY, topZ, frX, frY, topZ, rrX, rrY, topZ, rlX, rlY, topZ, topColor)
+        val zFL0 = bz + leftLift; val zFL1 = zFL0 + height
+        val zRL0 = bz + leftLift; val zRL1 = zRL0 + height
+        val zFR0 = bz + rightLift; val zFR1 = zFR0 + height
+        val zRR0 = bz + rightLift; val zRR1 = zRR0 + height
+
+        drawQuad3D(canvas, cx, cy, R, flX, flY, zFL0, rlX, rlY, zRL0, rlX, rlY, zRL1, flX, flY, zFL1, sideColor)
+        drawQuad3D(canvas, cx, cy, R, frX, frY, zFR0, rrX, rrY, zRR0, rrX, rrY, zRR1, frX, frY, zFR1, sideColor)
+        drawQuad3D(canvas, cx, cy, R, flX, flY, zFL0, frX, frY, zFR0, frX, frY, zFR1, flX, flY, zFL1, sideColor)
+        drawQuad3D(canvas, cx, cy, R, rlX, rlY, zRL0, rrX, rrY, zRR0, rrX, rrY, zRR1, rlX, rlY, zRL1, rearColor)
+        drawQuad3D(canvas, cx, cy, R, flX, flY, zFL1, frX, frY, zFR1, rrX, rrY, zRR1, rlX, rlY, zRL1, topColor)
     }
 
-    // ==================== 4 SPOR ARAÇ + ÖN SİLAHLAR + KORUMA KALKANI ÇİZİMİ ====================
     private fun drawSport3DCar(
         canvas: Canvas, cx: Float, cy: Float, R: Float,
-        x: Float, y: Float, zOffset: Float, yaw: Float,
+        x: Float, y: Float, zOffset: Float, yaw: Float, roll: Float,
         baseColor: Int, modelIdx: Int, isGhost: Boolean, isPlayer: Boolean = false,
         hasShield: Boolean = false, isSlowed: Boolean = false
     ) {
@@ -1433,7 +1502,7 @@ class CrownDriftView(context: Context) : View(context) {
         val g = Color.green(baseColor)
         val b = Color.blue(baseColor)
 
-        val damageDarken = if (isPlayer) (1f - (carDamage / 210f)) else 1f
+        val damageDarken = if (isPlayer) (1f - (carDamage / 200f)) else 1f
         val topCol = Color.argb(alpha, (r * damageDarken).toInt(), (g * damageDarken).toInt(), (b * damageDarken).toInt())
         val sideCol = Color.argb(alpha, (r * 0.75f * damageDarken).toInt(), (g * 0.75f * damageDarken).toInt(), (b * 0.75f * damageDarken).toInt())
         val rearCol = Color.argb(alpha, (r * 0.56f * damageDarken).toInt(), (g * 0.56f * damageDarken).toInt(), (b * 0.56f * damageDarken).toInt())
@@ -1441,8 +1510,9 @@ class CrownDriftView(context: Context) : View(context) {
         val wheelCol = Color.argb(alpha, 20, 22, 25)
         val chromeCol = Color.argb(alpha, 215, 220, 230)
 
-        val c = cos(yaw)
-        val s = sin(yaw)
+        val effectiveYaw = if (isPlayer && isCrashing) yaw + roll * 0.5f else yaw
+        val c = cos(effectiveYaw)
+        val s = sin(effectiveYaw)
         val rxVec = -s
         val ryVec = c
 
@@ -1459,109 +1529,119 @@ class CrownDriftView(context: Context) : View(context) {
             )
         }
 
-        val bz = zOffset + 1.4f
+        val bz = zOffset + 1.4f + abs(sin(roll)) * 3.0f
 
         if (!isGhost) {
             val wxF = 9.8f; val wxR = -9.8f
             val wyOff = if (modelIdx == 3) 10.4f else 9.4f
             val wWidth = if (modelIdx == 3) 2.2f else 1.7f
             val steerVisual = if (isPlayer) steerInput * 0.35f else 0f
-            draw3DBox(canvas, cx, cy, R, x + c * wxF - rxVec * wyOff, y + s * wxF - ryVec * wyOff, 0.5f + zOffset, 3.5f, wWidth, 3.6f, yaw + steerVisual, wheelCol, wheelCol, wheelCol)
-            draw3DBox(canvas, cx, cy, R, x + c * wxF + rxVec * wyOff, y + s * wxF + ryVec * wyOff, 0.5f + zOffset, 3.5f, wWidth, 3.6f, yaw + steerVisual, wheelCol, wheelCol, wheelCol)
-            draw3DBox(canvas, cx, cy, R, x + c * wxR - rxVec * wyOff, y + s * wxR - ryVec * wyOff, 0.5f + zOffset, 3.7f, wWidth, 3.8f, yaw, wheelCol, wheelCol, wheelCol)
-            draw3DBox(canvas, cx, cy, R, x + c * wxR + rxVec * wyOff, y + s * wxR + ryVec * wyOff, 0.5f + zOffset, 3.7f, wWidth, 3.8f, yaw, wheelCol, wheelCol, wheelCol)
+            drawTilted3DBox(canvas, cx, cy, R, x + c * wxF - rxVec * wyOff, y + s * wxF - ryVec * wyOff, 0.5f + zOffset, 3.5f, wWidth, 3.6f, effectiveYaw + steerVisual, roll * 0.5f, wheelCol, wheelCol, wheelCol)
+            drawTilted3DBox(canvas, cx, cy, R, x + c * wxF + rxVec * wyOff, y + s * wxF + ryVec * wyOff, 0.5f + zOffset, 3.5f, wWidth, 3.6f, effectiveYaw + steerVisual, roll * 0.5f, wheelCol, wheelCol, wheelCol)
+            drawTilted3DBox(canvas, cx, cy, R, x + c * wxR - rxVec * wyOff, y + s * wxR - ryVec * wyOff, 0.5f + zOffset, 3.7f, wWidth, 3.8f, effectiveYaw, roll * 0.5f, wheelCol, wheelCol, wheelCol)
+            drawTilted3DBox(canvas, cx, cy, R, x + c * wxR + rxVec * wyOff, y + s * wxR + ryVec * wyOff, 0.5f + zOffset, 3.7f, wWidth, 3.8f, effectiveYaw, roll * 0.5f, wheelCol, wheelCol, wheelCol)
         }
 
         when (modelIdx % 4) {
             0 -> {
                 val bodyLen = if (isPlayer && bumperBroken) 13.5f else 15.8f
-                draw3DBox(canvas, cx, cy, R, x, y, bz, bodyLen, 8.8f, 4.3f, yaw, topCol, sideCol, rearCol)
+                drawTilted3DBox(canvas, cx, cy, R, x, y, bz, bodyLen, 8.8f, 4.3f, effectiveYaw, roll, topCol, sideCol, rearCol)
                 if (!(isPlayer && bumperBroken)) {
-                    draw3DBox(canvas, cx, cy, R, x + c * 11.2f, y + s * 11.2f, bz + 0.4f, 4.8f, 8.2f, 2.8f, yaw, topCol, sideCol, wheelCol)
+                    drawTilted3DBox(canvas, cx, cy, R, x + c * 11.2f, y + s * 11.2f, bz + 0.4f, 4.8f, 8.2f, 2.8f, effectiveYaw, roll, topCol, sideCol, wheelCol)
                 }
-                draw3DBox(canvas, cx, cy, R, x - c * 1.5f, y - s * 1.5f, bz + 4.3f, 7.6f, 6.8f, 3.7f, yaw, topCol, glassCol, glassCol)
+                drawTilted3DBox(canvas, cx, cy, R, x - c * 1.5f, y - s * 1.5f, bz + 4.3f, 7.6f, 6.8f, 3.7f, effectiveYaw, roll, topCol, glassCol, glassCol)
                 if (!(isPlayer && spoilerBroken)) {
                     val spX = x - c * 14.0f; val spY = y - s * 14.0f
-                    draw3DBox(canvas, cx, cy, R, spX, spY, bz + 6.4f, 2.0f, 9.4f, 1.1f, yaw, wheelCol, sideCol, rearCol)
+                    drawTilted3DBox(canvas, cx, cy, R, spX, spY, bz + 6.4f, 2.0f, 9.4f, 1.1f, effectiveYaw, roll, wheelCol, sideCol, rearCol)
                 }
             }
             1 -> {
                 val bodyLen = if (isPlayer && bumperBroken) 14.0f else 16.8f
-                draw3DBox(canvas, cx, cy, R, x - c * 1.0f, y - s * 1.0f, bz, bodyLen * 0.85f, 9.8f, 3.4f, yaw, topCol, sideCol, rearCol)
+                drawTilted3DBox(canvas, cx, cy, R, x - c * 1.0f, y - s * 1.0f, bz, bodyLen * 0.85f, 9.8f, 3.4f, effectiveYaw, roll, topCol, sideCol, rearCol)
                 if (!(isPlayer && bumperBroken)) {
-                    draw3DBox(canvas, cx, cy, R, x + c * 12.0f, y + s * 12.0f, bz, 5.5f, 8.8f, 2.1f, yaw, topCol, sideCol, wheelCol)
+                    drawTilted3DBox(canvas, cx, cy, R, x + c * 12.0f, y + s * 12.0f, bz, 5.5f, 8.8f, 2.1f, effectiveYaw, roll, topCol, sideCol, wheelCol)
                 }
-                draw3DBox(canvas, cx, cy, R, x + c * 1.0f, y + s * 1.0f, bz + 3.4f, 8.2f, 6.4f, 2.9f, yaw, topCol, glassCol, rearCol)
-                draw3DBox(canvas, cx, cy, R, x - c * 4.5f, y - s * 4.5f, bz + 2.2f, 5.0f, 10.2f, 1.8f, yaw, sideCol, wheelCol, rearCol)
+                drawTilted3DBox(canvas, cx, cy, R, x + c * 1.0f, y + s * 1.0f, bz + 3.4f, 8.2f, 6.4f, 2.9f, effectiveYaw, roll, topCol, glassCol, rearCol)
+                drawTilted3DBox(canvas, cx, cy, R, x - c * 4.5f, y - s * 4.5f, bz + 2.2f, 5.0f, 10.2f, 1.8f, effectiveYaw, roll, sideCol, wheelCol, rearCol)
                 if (!(isPlayer && spoilerBroken)) {
-                    draw3DBox(canvas, cx, cy, R, x - c * 14.8f, y - s * 14.8f, bz + 4.8f, 2.2f, 10.2f, 0.9f, yaw, rearCol, sideCol, wheelCol)
+                    drawTilted3DBox(canvas, cx, cy, R, x - c * 14.8f, y - s * 14.8f, bz + 4.8f, 2.2f, 10.2f, 0.9f, effectiveYaw, roll, rearCol, sideCol, wheelCol)
                 }
             }
             2 -> {
                 val bodyLen = if (isPlayer && bumperBroken) 14.2f else 16.5f
-                draw3DBox(canvas, cx, cy, R, x, y, bz + 0.4f, bodyLen, 9.0f, 4.6f, yaw, topCol, sideCol, rearCol)
-                draw3DBox(canvas, cx, cy, R, x + c * 7.5f, y + s * 7.5f, bz + 5.0f, 3.8f, 3.2f, 2.4f, yaw, chromeCol, wheelCol, chromeCol)
-                draw3DBox(canvas, cx, cy, R, x - c * 3.8f, y - s * 3.8f, bz + 5.0f, 6.8f, 7.2f, 3.6f, yaw, topCol, glassCol, glassCol)
+                drawTilted3DBox(canvas, cx, cy, R, x, y, bz + 0.4f, bodyLen, 9.0f, 4.6f, effectiveYaw, roll, topCol, sideCol, rearCol)
+                drawTilted3DBox(canvas, cx, cy, R, x + c * 7.5f, y + s * 7.5f, bz + 5.0f, 3.8f, 3.2f, 2.4f, effectiveYaw, roll, chromeCol, wheelCol, chromeCol)
+                drawTilted3DBox(canvas, cx, cy, R, x - c * 3.8f, y - s * 3.8f, bz + 5.0f, 6.8f, 7.2f, 3.6f, effectiveYaw, roll, topCol, glassCol, glassCol)
                 if (!(isPlayer && spoilerBroken)) {
-                    draw3DBox(canvas, cx, cy, R, x - c * 15.2f, y - s * 15.2f, bz + 5.0f, 1.4f, 8.8f, 1.8f, yaw, rearCol, sideCol, rearCol)
+                    drawTilted3DBox(canvas, cx, cy, R, x - c * 15.2f, y - s * 15.2f, bz + 5.0f, 1.4f, 8.8f, 1.8f, effectiveYaw, roll, rearCol, sideCol, rearCol)
                 }
             }
             else -> {
-                draw3DBox(canvas, cx, cy, R, x - c * 1.5f, y - s * 1.5f, bz, 11.5f, 7.6f, 3.2f, yaw, topCol, sideCol, rearCol)
-                draw3DBox(canvas, cx, cy, R, x + c * 4.5f, y + s * 4.5f, bz + 0.4f, 12.5f, 3.4f, 3.0f, yaw, topCol, sideCol, rearCol)
+                drawTilted3DBox(canvas, cx, cy, R, x - c * 1.5f, y - s * 1.5f, bz, 11.5f, 7.6f, 3.2f, effectiveYaw, roll, topCol, sideCol, rearCol)
+                drawTilted3DBox(canvas, cx, cy, R, x + c * 4.5f, y + s * 4.5f, bz + 0.4f, 12.5f, 3.4f, 3.0f, effectiveYaw, roll, topCol, sideCol, rearCol)
                 if (!(isPlayer && bumperBroken)) {
-                    draw3DBox(canvas, cx, cy, R, x + c * 16.2f, y + s * 16.2f, bz - 0.4f, 2.2f, 10.6f, 1.1f, yaw, chromeCol, topCol, sideCol)
+                    drawTilted3DBox(canvas, cx, cy, R, x + c * 16.2f, y + s * 16.2f, bz - 0.4f, 2.2f, 10.6f, 1.1f, effectiveYaw, roll, chromeCol, topCol, sideCol)
                 }
-                draw3DBox(canvas, cx, cy, R, x - c * 1.0f, y - s * 1.0f, bz + 3.2f, 4.5f, 3.2f, 3.2f, yaw, glassCol, glassCol, rearCol)
-                draw3DBox(canvas, cx, cy, R, x - c * 8.0f, y - s * 8.0f, bz + 3.2f, 5.0f, 0.8f, 3.6f, yaw, topCol, sideCol, rearCol)
+                drawTilted3DBox(canvas, cx, cy, R, x - c * 1.0f, y - s * 1.0f, bz + 3.2f, 4.5f, 3.2f, 3.2f, effectiveYaw, roll, glassCol, glassCol, rearCol)
+                drawTilted3DBox(canvas, cx, cy, R, x - c * 8.0f, y - s * 8.0f, bz + 3.2f, 5.0f, 0.8f, 3.6f, effectiveYaw, roll, topCol, sideCol, rearCol)
                 if (!(isPlayer && spoilerBroken)) {
-                    draw3DBox(canvas, cx, cy, R, x - c * 14.8f, y - s * 14.8f, bz + 5.8f, 2.6f, 9.8f, 1.4f, yaw, chromeCol, topCol, rearCol)
+                    drawTilted3DBox(canvas, cx, cy, R, x - c * 14.8f, y - s * 14.8f, bz + 5.8f, 2.6f, 9.8f, 1.4f, effectiveYaw, roll, chromeCol, topCol, rearCol)
                 }
             }
         }
 
-        // ARAÇ ÖNÜ SİLAHLARI GÖRSEL YERLEŞİMİ (Süre Boyunca Araç Üzerinde Görünür)
+        // Araç Önü Silahları (Füze Rampaları ve Taret)
         if (isPlayer && weaponTimer > 0f) {
             if (activeWeaponType == 1 && weaponAmmo > 0) {
-                // Füze Rampaları (Ön Sağ ve Sol Çamurluk Üstü)
                 val podX = x + c * 10.5f
                 val podY = y + s * 10.5f
                 val missileRed = Color.rgb(255, 60, 40)
-                draw3DBox(canvas, cx, cy, R, podX - rxVec * 6.5f, podY - ryVec * 6.5f, bz + 4.2f, 5.2f, 1.4f, 1.6f, yaw, chromeCol, missileRed, wheelCol)
+                drawTilted3DBox(canvas, cx, cy, R, podX - rxVec * 6.5f, podY - ryVec * 6.5f, bz + 4.2f, 5.2f, 1.4f, 1.6f, effectiveYaw, roll, chromeCol, missileRed, wheelCol)
                 if (weaponAmmo >= 2) {
-                    draw3DBox(canvas, cx, cy, R, podX + rxVec * 6.5f, podY + ryVec * 6.5f, bz + 4.2f, 5.2f, 1.4f, 1.6f, yaw, chromeCol, missileRed, wheelCol)
+                    drawTilted3DBox(canvas, cx, cy, R, podX + rxVec * 6.5f, podY + ryVec * 6.5f, bz + 4.2f, 5.2f, 1.4f, 1.6f, effectiveYaw, roll, chromeCol, missileRed, wheelCol)
                 }
             } else if (activeWeaponType == 4) {
-                // Kaput Üstü Çift Namlulu Taret (Araç Önü Silahı)
                 val gunX = x + c * 11.8f
                 val gunY = y + s * 11.8f
                 val gunCol = Color.rgb(50, 55, 65)
                 val barrelCol = Color.rgb(0, 235, 255)
-                draw3DBox(canvas, cx, cy, R, gunX, gunY, bz + 3.8f, 3.2f, 3.0f, 2.2f, yaw, gunCol, gunCol, wheelCol)
-                draw3DBox(canvas, cx, cy, R, gunX + c * 4.5f - rxVec * 1.4f, gunY + s * 4.5f - ryVec * 1.4f, bz + 4.4f, 4.2f, 0.7f, 0.8f, yaw, barrelCol, chromeCol, gunCol)
-                draw3DBox(canvas, cx, cy, R, gunX + c * 4.5f + rxVec * 1.4f, gunY + s * 4.5f + ryVec * 1.4f, bz + 4.4f, 4.2f, 0.7f, 0.8f, yaw, barrelCol, chromeCol, gunCol)
+                drawTilted3DBox(canvas, cx, cy, R, gunX, gunY, bz + 3.8f, 3.2f, 3.0f, 2.2f, effectiveYaw, roll, gunCol, gunCol, wheelCol)
+                drawTilted3DBox(canvas, cx, cy, R, gunX + c * 4.5f - rxVec * 1.4f, gunY + s * 4.5f - ryVec * 1.4f, bz + 4.4f, 4.2f, 0.7f, 0.8f, effectiveYaw, roll, barrelCol, chromeCol, gunCol)
+                drawTilted3DBox(canvas, cx, cy, R, gunX + c * 4.5f + rxVec * 1.4f, gunY + s * 4.5f + ryVec * 1.4f, bz + 4.4f, 4.2f, 0.7f, 0.8f, effectiveYaw, roll, barrelCol, chromeCol, gunCol)
             }
         }
 
-        // Arka Stoplar ve Turbo Alevi
+        // Arka Stoplar ve Turbo / Drift Egzoz Alevleri
         if (!isGhost) {
             val tailX = x - c * 15.5f
             val tailY = y - s * 15.5f
             val tailCol = if (isPlayer && isFullStopped) Color.rgb(255, 220, 40) else Color.rgb(255, 30, 30)
-            draw3DBox(canvas, cx, cy, R, tailX - rxVec * 5.2f, tailY - ryVec * 5.2f, bz + 2.0f, 0.8f, 2.0f, 1.1f, yaw, tailCol, tailCol, tailCol)
-            draw3DBox(canvas, cx, cy, R, tailX + rxVec * 5.2f, tailY + ryVec * 5.2f, bz + 2.0f, 0.8f, 2.0f, 1.1f, yaw, tailCol, tailCol, tailCol)
+            drawTilted3DBox(canvas, cx, cy, R, tailX - rxVec * 5.2f, tailY - ryVec * 5.2f, bz + 2.0f, 0.8f, 2.0f, 1.1f, effectiveYaw, roll, tailCol, tailCol, tailCol)
+            drawTilted3DBox(canvas, cx, cy, R, tailX + rxVec * 5.2f, tailY + ryVec * 5.2f, bz + 2.0f, 0.8f, 2.0f, 1.1f, effectiveYaw, roll, tailCol, tailCol, tailCol)
 
-            // Turbo Aktifken Parlak Mavi İkiz Alev
             if (isPlayer && turboActiveTimer > 0f) {
                 val flX = tailX - c * 3.5f
                 val flY = tailY - s * 3.5f
                 val turboFlameCol = Color.rgb(0, 225, 255)
-                draw3DBox(canvas, cx, cy, R, flX - rxVec * 3.5f, flY - ryVec * 3.5f, bz + 0.8f, 4.2f, 1.3f, 1.2f, yaw, turboFlameCol, Color.WHITE, turboFlameCol)
-                draw3DBox(canvas, cx, cy, R, flX + rxVec * 3.5f, flY + ryVec * 3.5f, bz + 0.8f, 4.2f, 1.3f, 1.2f, yaw, turboFlameCol, Color.WHITE, turboFlameCol)
+                drawTilted3DBox(canvas, cx, cy, R, flX - rxVec * 3.5f, flY - ryVec * 3.5f, bz + 0.8f, 4.2f, 1.3f, 1.2f, effectiveYaw, roll, turboFlameCol, Color.WHITE, turboFlameCol)
+                drawTilted3DBox(canvas, cx, cy, R, flX + rxVec * 3.5f, flY + ryVec * 3.5f, bz + 0.8f, 4.2f, 1.3f, 1.2f, effectiveYaw, roll, turboFlameCol, Color.WHITE, turboFlameCol)
+            } else if (isPlayer && driftCombo >= 2 && (SystemClock.uptimeMillis() / 60) % 2L == 0L) {
+                val flX = tailX - c * 2.5f
+                val flY = tailY - s * 2.5f
+                val driftFlameCol = Color.rgb(255, 140, 20)
+                drawTilted3DBox(canvas, cx, cy, R, flX - rxVec * 3.5f, flY - ryVec * 3.5f, bz + 0.8f, 2.6f, 1.0f, 1.0f, effectiveYaw, roll, driftFlameCol, driftFlameCol, driftFlameCol)
+                drawTilted3DBox(canvas, cx, cy, R, flX + rxVec * 3.5f, flY + ryVec * 3.5f, bz + 0.8f, 2.6f, 1.0f, 1.0f, effectiveYaw, roll, driftFlameCol, driftFlameCol, driftFlameCol)
             }
         }
 
-        // 3 Saniyelik Yeniden Doğma Koruma Kalkanı Görsel Halkası
+        // Sonik Şok Dalgası (Shockwave) Görsel Halkası
+        if (isPlayer && shockwaveRadius > 0f && project3D(x, y, bz + 2f, cx, cy, R)) {
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = 4.5f
+            paint.color = Color.argb(220, 255, 215, 30)
+            canvas.drawCircle(projX, projY, shockwaveRadius * projScale, paint)
+        }
+
         if (hasShield && project3D(x, y, bz + 4f, cx, cy, R)) {
             paint.style = Paint.Style.STROKE
             paint.strokeWidth = 3.5f
@@ -1569,7 +1649,6 @@ class CrownDriftView(context: Context) : View(context) {
             canvas.drawCircle(projX, projY, 22f * projScale, paint)
         }
 
-        // Yavaşlatma (EMP) Etkisi Halkası
         if (isSlowed && project3D(x, y, bz + 5f, cx, cy, R)) {
             paint.style = Paint.Style.STROKE
             paint.strokeWidth = 3.0f
@@ -1592,7 +1671,7 @@ class CrownDriftView(context: Context) : View(context) {
         }
         canvas.drawColor(bgColor)
 
-        // 1. Optimize Edilmiş Zemin Izgarası
+        // 1. Zemin Izgarası (Arka alanları da kapsayacak şekilde -6..6)
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = 1.2f
         paint.color = when (theme) {
@@ -1602,12 +1681,12 @@ class CrownDriftView(context: Context) : View(context) {
             3 -> Color.rgb(150, 190, 215)
             else -> Color.rgb(115, 70, 42)
         }
-        val gridStep = 65f
+        val gridStep = 60f
         val baseGX = ((carX / gridStep).toInt()) * gridStep
         val baseGY = ((carY / gridStep).toInt()) * gridStep
-        for (i in -5..5) {
+        for (i in -6..6) {
             val gx = baseGX + i * gridStep
-            for (j in -5..4) {
+            for (j in -6..5) {
                 val gy1 = baseGY + j * gridStep
                 val gy2 = gy1 + gridStep
                 if (project3D(gx, gy1, 0f, cx, cy, R)) {
@@ -1619,12 +1698,12 @@ class CrownDriftView(context: Context) : View(context) {
             }
         }
 
-        // 2. 3B Pist Yolu ve Bordürler (Sadece Görüş Alanındakiler İşlenir)
+        // 2. 3B Pist Yolu ve Bordürler (Arkadaki yolun kaybolmaması için 46'dan -26'ya kadar tam çizim!)
         val total = trackPts.size
         val kerbW = 9.5f
         val roadCol = if (theme == 3) Color.rgb(75, 90, 105) else Color.rgb(70, 74, 78)
 
-        for (step in 36 downTo -8) {
+        for (step in 46 downTo -26) {
             val i0 = (currentWp + step + total) % total
             val i1 = (i0 + 1) % total
             val p0 = trackPts[i0]
@@ -1658,7 +1737,7 @@ class CrownDriftView(context: Context) : View(context) {
             }
         }
 
-        // 3. Lastik İzleri
+        // 3. Lastik ve Çim İzleri
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = 3.0f
         for (mark in tirePool) {
@@ -1678,60 +1757,54 @@ class CrownDriftView(context: Context) : View(context) {
             }
         }
 
-        // 4. Yoldaki Dikenli Tuzaklar (Spike Traps)
-        for (sp in spikePool) {
-            if (!sp.active) continue
-            draw3DBox(canvas, cx, cy, R, sp.x, sp.y, 0.4f, 4.5f, 14.5f, 2.2f, sp.yaw, Color.rgb(230, 235, 240), Color.rgb(220, 40, 40), Color.DKGRAY)
-        }
-
-        // 5. Rastgele Güç Kutuları (Power-Up Boxes)
+        // 4. Rastgele Güç Kutuları
         val boxSpinYaw = (SystemClock.uptimeMillis() % 3600L) / 573f
         for (pb in powerUpPool) {
             if (!pb.active) continue
-            draw3DBox(canvas, cx, cy, R, pb.x, pb.y, 3.0f, 6.5f, 6.5f, 9.0f, boxSpinYaw, Color.rgb(0, 235, 255), Color.rgb(255, 195, 20), Color.rgb(235, 50, 140))
+            drawTilted3DBox(canvas, cx, cy, R, pb.x, pb.y, 3.0f, 6.5f, 6.5f, 9.0f, boxSpinYaw, 0f, Color.rgb(0, 235, 255), Color.rgb(255, 195, 20), Color.rgb(235, 50, 140))
         }
 
-        // 6. Sabit Ağaç/Binalar ve Yol Bariyer Engelleri (Görünürlük Kırpmalı)
+        // 5. Sabit Ağaç/Binalar ve Kırılabilir Yol Bariyerleri
         for (obs in obstacles) {
             if (!obs.active) continue
             val dx = obs.x - carX
             val dy = obs.y - carY
-            if (dx * dx + dy * dy < 320000f) {
+            if (dx * dx + dy * dy < 360000f) {
                 if (obs.isRoadBarrier) {
                     val bYaw = trackTangents[obs.wpIdx]
-                    draw3DBox(canvas, cx, cy, R, obs.x, obs.y, 0f, 6.5f, 12.5f, obs.height, bYaw, Color.rgb(255, 125, 20), Color.WHITE, Color.rgb(220, 50, 30))
+                    drawTilted3DBox(canvas, cx, cy, R, obs.x, obs.y, 0f, 5.5f, 12.5f, obs.height, bYaw, 0f, Color.rgb(255, 125, 20), Color.WHITE, Color.rgb(220, 50, 30))
                 } else if (obs.isTree) {
-                    draw3DBox(canvas, cx, cy, R, obs.x, obs.y, 0f, obs.radius, obs.radius, obs.height, 0f, Color.rgb(65, 185, 75), Color.rgb(45, 145, 55), Color.rgb(35, 120, 45))
+                    drawTilted3DBox(canvas, cx, cy, R, obs.x, obs.y, 0f, obs.radius, obs.radius, obs.height, 0f, 0f, Color.rgb(65, 185, 75), Color.rgb(45, 145, 55), Color.rgb(35, 120, 45))
                 } else {
-                    draw3DBox(canvas, cx, cy, R, obs.x, obs.y, 0f, obs.radius, obs.radius, obs.height, 0f, Color.rgb(45, 50, 70), Color.rgb(28, 32, 48), Color.rgb(22, 25, 38))
+                    drawTilted3DBox(canvas, cx, cy, R, obs.x, obs.y, 0f, obs.radius, obs.radius, obs.height, 0f, 0f, Color.rgb(45, 50, 70), Color.rgb(28, 32, 48), Color.rgb(22, 25, 38))
                 }
             }
         }
 
-        // 7. Füzeler ve Taret Mermileri
+        // 6. Füzeler ve Taret Mermileri
         for (m in missilePool) {
             if (!m.active) continue
             val mCol = if (m.isBullet) Color.rgb(0, 245, 255) else Color.rgb(255, 70, 30)
-            draw3DBox(canvas, cx, cy, R, m.x, m.y, m.z, if (m.isBullet) 4.5f else 7.5f, 2.0f, 2.0f, m.yaw, Color.WHITE, mCol, Color.YELLOW)
+            drawTilted3DBox(canvas, cx, cy, R, m.x, m.y, m.z, if (m.isBullet) 4.5f else 7.5f, 2.0f, 2.0f, m.yaw, 0f, Color.WHITE, mCol, Color.YELLOW)
         }
 
-        // 8. Kırık Araç Parçaları
+        // 7. Yere Düşen Kırık Araç ve Bariyer Parçaları (Debris)
         for (d in debrisPool) {
             if (!d.active) continue
-            draw3DBox(canvas, cx, cy, R, d.x, d.y, d.z, d.size, d.size * 0.7f, d.size * 0.5f, d.yaw, d.color, d.color, Color.DKGRAY)
+            drawTilted3DBox(canvas, cx, cy, R, d.x, d.y, d.z, d.size, d.size * 0.7f, d.size * 0.5f, d.yaw, d.yaw * 0.5f, d.color, d.color, Color.DKGRAY)
         }
 
-        // 9. Hayalet Araç
+        // 8. Hayalet Araç
         if (ghostEnabled && bestLapGhost.isNotEmpty()) {
             val gPose = bestLapGhost[ghostFrameIdx.coerceAtMost(bestLapGhost.size - 1)]
-            drawSport3DCar(canvas, cx, cy, R, gPose.x, gPose.y, 0f, gPose.yaw, Color.rgb(0, 225, 255), selectedModel, isGhost = true)
+            drawSport3DCar(canvas, cx, cy, R, gPose.x, gPose.y, 0f, gPose.yaw, 0f, Color.rgb(0, 225, 255), selectedModel, isGhost = true)
         }
 
-        // 10. Co-op Oyuncular
+        // 9. Co-op Oyuncular
         for (i in 0..2) {
             val rp = remotePlayers[i]
             if (rp.active) {
-                drawSport3DCar(canvas, cx, cy, R, rp.x, rp.y, 0f, rp.yaw, carColors[rp.colorIdx], rp.modelIdx, isGhost = false)
+                drawSport3DCar(canvas, cx, cy, R, rp.x, rp.y, 0f, rp.yaw, 0f, carColors[rp.colorIdx], rp.modelIdx, isGhost = false)
                 if (project3D(rp.x, rp.y, 16f, cx, cy, R)) {
                     paint.style = Paint.Style.FILL
                     paint.color = Color.rgb(0, 255, 220)
@@ -1742,25 +1815,27 @@ class CrownDriftView(context: Context) : View(context) {
             }
         }
 
-        // 11. Gerçek Fizikli AI Araçları
+        // 10. AI Araçları
         if (botsEnabled) {
             for (bot in bots) {
+                val bRoll = if (bot.isCrashing) bot.flipRoll else 0f
                 drawSport3DCar(
-                    canvas, cx, cy, R, bot.x, bot.y, bot.z, bot.yaw,
+                    canvas, cx, cy, R, bot.x, bot.y, bot.z, bot.yaw, bRoll,
                     bot.color, bot.modelIdx, isGhost = false, isPlayer = false,
                     hasShield = (bot.shieldTimer > 0f), isSlowed = (bot.slowTimer > 0f)
                 )
             }
         }
 
-        // 12. Oyuncunun 3B Spor Aracı
+        // 11. Oyuncunun 3B Spor Aracı (Çarpışma Sarsıntısı ve Patlama Taklası Dahil)
+        val activeRoll = if (isCrashing) flipRollAngle else impactTiltAngle
         drawSport3DCar(
-            canvas, cx, cy, R, carX, carY, carZ, carYaw,
+            canvas, cx, cy, R, carX, carY, carZ, carYaw, activeRoll,
             carColors[selectedColor], selectedModel, isGhost = false, isPlayer = true,
             hasShield = (shieldTimer > 0f), isSlowed = (playerSlowTimer > 0f)
         )
 
-        // 13. Parçacık Efektleri
+        // 12. Duman, Alev ve Patlama Parçacıkları
         paint.style = Paint.Style.FILL
         for (p in particlePool) {
             if (!p.active) continue
@@ -1771,7 +1846,7 @@ class CrownDriftView(context: Context) : View(context) {
         }
     }
 
-    // ==================== OYUNCUYLA BİREBİR AYNI FİZİĞE SAHİP REKABETÇİ AI BOT MOTORU ====================
+    // ==================== REKABETÇİ AI BOT FİZİĞİ ====================
     private fun updateBotsPhysics(dt: Float) {
         val total = trackPts.size
         val baseMaxForward = when (selectedModel) { 0 -> 265f; 1 -> 285f; 2 -> 275f; else -> 305f }
@@ -1781,11 +1856,19 @@ class CrownDriftView(context: Context) : View(context) {
             if (bot.slowTimer > 0f) bot.slowTimer -= dt
             if (bot.turboTimer > 0f) bot.turboTimer -= dt
 
-            // AI Patlama ve Güvenli Yolda Yeniden Doğma
+            // AI Patladığında Takla Atıp Yeniden Doğması
             if (bot.isCrashing) {
                 bot.crashTimer -= dt
+                bot.flipRoll += 10.5f * dt
+                bot.z += bot.vz * dt
+                bot.vz -= 235f * dt
+                if (bot.z < 0f) {
+                    bot.z = 0f
+                    bot.vz = abs(bot.vz) * 0.45f
+                }
                 if (bot.crashTimer <= 0f) {
                     bot.isCrashing = false
+                    bot.flipRoll = 0f
                     bot.damage = 0f
                     bot.z = 0f
                     val safeWp = findNearestWaypointLocal(bot.x, bot.y, bot.currentWp)
@@ -1799,35 +1882,32 @@ class CrownDriftView(context: Context) : View(context) {
                 continue
             }
 
-            // Tuzak veya Füze İsabetinde Dönerek Kontrol Kaybetme
             if (bot.spinTimer > 0f) {
                 bot.spinTimer -= dt
                 bot.yaw += 9.5f * dt
                 bot.speed *= (1f - 2.2f * dt)
-                bot.x += cos(bot.velYaw) * bot.speed * dt
-                bot.y += sin(bot.velYaw) * bot.speed * dt
+                bot.x += (cos(bot.velYaw) * bot.speed + bot.vx) * dt
+                bot.y += (sin(bot.velYaw) * bot.speed + bot.vy) * dt
+                bot.vx *= 0.88f
+                bot.vy *= 0.88f
                 continue
             }
 
-            // 1. Yerel Yol Noktasını Bul
             bot.currentWp = findNearestWaypointLocal(bot.x, bot.y, bot.currentWp)
             val wp = bot.currentWp
             val pt = trackPts[wp]
             val distFromCenterSq = (bot.x - pt.x) * (bot.x - pt.x) + (bot.y - pt.y) * (bot.y - pt.y)
             val botOffRoad = distFromCenterSq > (roadHalfWidth + 4f) * (roadHalfWidth + 4f)
 
-            // 2. İnsansı Sürüş Hatası ve Engel/Tuzak Kaçınma Kararı
             bot.errorTimer -= dt
             if (bot.errorTimer <= 0f) {
                 bot.errorTimer = 2.0f + Random.nextFloat() * 2.5f
-                // Zaman zaman virajı geniş/dar alma hatası
-                bot.errorOffset = if (Random.nextInt(4) == 0) (Random.nextFloat() * 28f - 14f) else 0f
+                bot.errorOffset = if (Random.nextInt(4) == 0) (Random.nextFloat() * 26f - 13f) else 0f
             }
 
-            // İlerideki yol bariyerlerini veya dikenli tuzakları kontrol edip şerit değiştir
             val lookCheckWp = (wp + 10) % total
             for (obs in obstacles) {
-                if (obs.isRoadBarrier && abs(obs.wpIdx - lookCheckWp) <= 6) {
+                if (obs.active && obs.isRoadBarrier && abs(obs.wpIdx - lookCheckWp) <= 6) {
                     val ox = obs.x - trackPts[obs.wpIdx].x
                     val oy = obs.y - trackPts[obs.wpIdx].y
                     val obsLane = ox * trackNormals[obs.wpIdx].x + oy * trackNormals[obs.wpIdx].y
@@ -1838,7 +1918,6 @@ class CrownDriftView(context: Context) : View(context) {
             }
             bot.preferredLane += (bot.targetLane + bot.errorOffset - bot.preferredLane).coerceIn(-35f * dt, 35f * dt)
 
-            // 3. Viraj Keskinliği Analizi, Frenleme ve Drift
             val targetWp = (wp + 7) % total
             val farWp = (wp + 15) % total
             val cornerSeverity = abs(wrapAngle(trackTangents[farWp] - trackTangents[wp]))
@@ -1852,9 +1931,8 @@ class CrownDriftView(context: Context) : View(context) {
             val angleErr = wrapAngle(desiredYaw - bot.yaw)
             bot.steerInput = (angleErr * 1.85f).coerceIn(-1f, 1f)
 
-            // Oyuncuyla Aynı Hız, İvmelenme, Frenleme ve Drift Fiziği
             var botMaxSpd = baseMaxForward * bot.skillProfile
-            if (cornerSeverity > 0.55f) botMaxSpd *= 0.82f // Keskin virajda gerçekçi frenleme
+            if (cornerSeverity > 0.55f) botMaxSpd *= 0.82f
             if (botOffRoad) botMaxSpd *= 0.56f
             if (bot.slowTimer > 0f) botMaxSpd *= 0.65f
             if (bot.turboTimer > 0f) botMaxSpd *= 1.24f
@@ -1862,14 +1940,11 @@ class CrownDriftView(context: Context) : View(context) {
             val accel = if (botOffRoad) 230f else if (bot.turboTimer > 0f) 320f else 195f
             bot.speed += (botMaxSpd - bot.speed).coerceIn(-accel * dt, accel * dt)
 
-            val turnRate = 3.25f
-            bot.yaw += bot.steerInput * turnRate * dt
-
+            bot.yaw += bot.steerInput * 3.25f * dt
             val driftGrip = if (botOffRoad) 1.45f else 2.15f
             val slipDiff = wrapAngle(bot.yaw - bot.velYaw)
             bot.velYaw += slipDiff * driftGrip * dt
 
-            // AI Drift yaptıkça kendi turbosunu doldurup kullanır
             if (abs(slipDiff) > 0.14f && !botOffRoad) {
                 bot.turboMeter = (bot.turboMeter + 18f * dt).coerceAtMost(100f)
                 if (bot.turboMeter >= 100f && cornerSeverity < 0.25f) {
@@ -1878,10 +1953,12 @@ class CrownDriftView(context: Context) : View(context) {
                 }
             }
 
-            bot.x += cos(bot.velYaw) * bot.speed * dt
-            bot.y += sin(bot.velYaw) * bot.speed * dt
+            bot.x += (cos(bot.velYaw) * bot.speed + bot.vx) * dt
+            bot.y += (sin(bot.velYaw) * bot.speed + bot.vy) * dt
+            bot.vx *= 0.88f
+            bot.vy *= 0.88f
 
-            // 4. AI Engel Çarpışması (AI da engellere çarpabilir!)
+            // AI Engel Çarpışması (Kırılabilir bariyerleri kırar, kademeli hasar alır)
             if (bot.shieldTimer <= 0f) {
                 for (obs in obstacles) {
                     if (!obs.active) continue
@@ -1889,22 +1966,30 @@ class CrownDriftView(context: Context) : View(context) {
                     val dy = bot.y - obs.y
                     val minD = obs.radius + 10.5f
                     if (dx * dx + dy * dy < minD * minD) {
-                        val pushAng = atan2(dy, dx)
-                        bot.x = obs.x + cos(pushAng) * minD
-                        bot.y = obs.y + sin(pushAng) * minD
-                        bot.speed *= 0.45f
-                        bot.damage += 38f
-                        bot.targetLane = -bot.targetLane
+                        if (obs.isRoadBarrier) {
+                            obs.active = false
+                            obs.respawnTimer = 12f
+                            bot.speed *= 0.65f
+                            bot.damage += 18f
+                            spawnDebris(obs.x, obs.y, 5, Color.rgb(255, 125, 20))
+                        } else {
+                            val pushAng = atan2(dy, dx)
+                            bot.x = obs.x + cos(pushAng) * minD
+                            bot.y = obs.y + sin(pushAng) * minD
+                            bot.speed *= 0.45f
+                            bot.damage += 32f
+                            bot.targetLane = -bot.targetLane
+                        }
                         if (bot.damage >= 100f) {
                             bot.isCrashing = true
-                            bot.crashTimer = 1.5f
+                            bot.crashTimer = 1.6f
+                            bot.vz = 130f
                         }
                         break
                     }
                 }
             }
 
-            // 5. AI Tur ve İlerleme Hesabı
             if (bot.currentWp > bot.maxWpReached && bot.currentWp - bot.maxWpReached < total / 3) {
                 bot.maxWpReached = bot.currentWp
             }
@@ -1915,7 +2000,6 @@ class CrownDriftView(context: Context) : View(context) {
             bot.totalProgress = (bot.lap - 1) * total + bot.currentWp.toFloat()
         }
 
-        // Botların Birbiriyle Çarpışması
         for (i in 0 until bots.size) {
             for (j in i + 1 until bots.size) {
                 val b1 = bots[i]; val b2 = bots[j]
@@ -1934,7 +2018,6 @@ class CrownDriftView(context: Context) : View(context) {
 
     // ==================== ANA FİZİK DÖNGÜSÜ ====================
     private fun updateGamePhysics(dt: Float, now: Long) {
-        // 1. Turnuva Başlangıç Geri Sayımı (3, 2, 1, BAŞLA!)
         if (countdownTimer > 0f) {
             countdownTimer -= dt
             val sec = ceil(countdownTimer - 0.4f).toInt()
@@ -1947,16 +2030,22 @@ class CrownDriftView(context: Context) : View(context) {
             }
             if (countdownTimer > 0.4f) {
                 lapStartTime = now
-                return // Geri sayım sırasında araçlar başlangıç çizgisinde bekler
+                return
             }
         }
 
         currentLapTime = (now - lapStartTime) / 1000f
         if (shieldTimer > 0f) shieldTimer = (shieldTimer - dt).coerceAtLeast(0f)
+        if (respawnBannerTimer > 0f) respawnBannerTimer = (respawnBannerTimer - dt).coerceAtLeast(0f)
         if (playerSlowTimer > 0f) playerSlowTimer = (playerSlowTimer - dt).coerceAtLeast(0f)
         if (turboActiveTimer > 0f) turboActiveTimer = (turboActiveTimer - dt).coerceAtLeast(0f)
+        impactTiltAngle *= (1f - 6.5f * dt)
 
-        // Silah Süresi ve Otomatik Ateşleme Kontrolü
+        if (shockwaveRadius > 0f) {
+            shockwaveRadius += 280f * dt
+            if (shockwaveRadius > 145f) shockwaveRadius = 0f
+        }
+
         if (activeWeaponType != 0) {
             weaponTimer -= dt
             if (weaponTimer <= 0f) {
@@ -1968,15 +2057,22 @@ class CrownDriftView(context: Context) : View(context) {
             }
         }
 
-        // Dinamik Yol Bariyerlerini Aracın Çok İlerisinde Adil Şekilde Güncelle
+        // Kırılan Yol Bariyerlerinin Yeniden Doğması ve Konum Değiştirmesi
         dynamicBarrierShiftTimer += dt
+        for (obs in obstacles) {
+            if (obs.isRoadBarrier && !obs.active) {
+                obs.respawnTimer -= dt
+                if (obs.respawnTimer <= 0f) {
+                    obs.active = true
+                }
+            }
+        }
         if (dynamicBarrierShiftTimer > 6.0f) {
             dynamicBarrierShiftTimer = 0f
             val total = trackPts.size
             for (obs in obstacles) {
-                if (obs.isRoadBarrier) {
+                if (obs.isRoadBarrier && obs.active) {
                     val aheadDist = (obs.wpIdx - currentWp + total) % total
-                    // Sadece aracın arkasında kalmış (görünmeyen) bariyerlerin şeridini değiştir
                     if (aheadDist in (total - 35)..(total - 10)) {
                         val newLane = if (Random.nextBoolean()) -22f else 22f
                         val pt = trackPts[obs.wpIdx]
@@ -1988,7 +2084,7 @@ class CrownDriftView(context: Context) : View(context) {
             }
         }
 
-        // Güç Kutularının Yeniden Çıkma Zamanlayıcısı ve Toplanması
+        // Güç Kutuları
         for (pb in powerUpPool) {
             if (!pb.active) {
                 pb.respawnTimer -= dt
@@ -2004,7 +2100,7 @@ class CrownDriftView(context: Context) : View(context) {
             }
         }
 
-        // Güdümlü Füzelerin ve Taret Mermilerinin Fiziği
+        // Füzeler ve Taret Mermileri
         for (m in missilePool) {
             if (!m.active) continue
             m.life -= dt
@@ -2020,7 +2116,6 @@ class CrownDriftView(context: Context) : View(context) {
             m.x += cos(m.yaw) * m.speed * dt
             m.y += sin(m.yaw) * m.speed * dt
 
-            // Rakip Botlara İsabet Kontrolü
             for (bot in bots) {
                 if (bot.isCrashing || bot.shieldTimer > 0f) continue
                 val dx = m.x - bot.x
@@ -2029,7 +2124,7 @@ class CrownDriftView(context: Context) : View(context) {
                     m.active = false
                     bot.spinTimer = if (m.isBullet) 0.55f else 1.45f
                     bot.speed *= 0.35f
-                    bot.damage += if (m.isBullet) 25f else 55f
+                    bot.damage += if (m.isBullet) 22f else 48f
                     spawnDebris(bot.x, bot.y, 5, bot.color)
                     spawnParticle(bot.x, bot.y, 6f, 0f, 0f, 35f, 6.0f, Color.rgb(255, 130, 20), 230)
                     triggerHaptic(35L, 220)
@@ -2038,32 +2133,7 @@ class CrownDriftView(context: Context) : View(context) {
             }
         }
 
-        // Yoldaki Dikenli Tuzakların Kontrolü
-        for (sp in spikePool) {
-            if (!sp.active) continue
-            sp.life -= dt
-            if (sp.ignorePlayerTimer > 0f) sp.ignorePlayerTimer -= dt
-            if (sp.life <= 0f) {
-                sp.active = false
-                continue
-            }
-            // Rakip Botlar Tuzağa Çarparsa Devrilir / Döner
-            for (bot in bots) {
-                if (bot.isCrashing || bot.shieldTimer > 0f || bot.spinTimer > 0f) continue
-                val dx = bot.x - sp.x
-                val dy = bot.y - sp.y
-                if (dx * dx + dy * dy < 324f) {
-                    sp.active = false
-                    bot.spinTimer = 1.6f
-                    bot.speed *= 0.30f
-                    spawnDebris(bot.x, bot.y, 4, bot.color)
-                    triggerHaptic(30L, 190)
-                    break
-                }
-            }
-        }
-
-        // Kırık Parçalar ve Parçacıklar
+        // Kırık Parçaların (Debris) Zıplama Fiziği
         for (d in debrisPool) {
             if (!d.active) continue
             d.life -= dt
@@ -2078,41 +2148,66 @@ class CrownDriftView(context: Context) : View(context) {
                 }
             }
         }
+
+        // ESKİ SÜRÜMDEKİ HASAR DUMANI VE MOTOR ALEVİ EFEKTLERİ
+        if (carDamage > 25f && Random.nextInt(3) == 0) {
+            // Gri/Siyah Motor Dumanı
+            val smokeCol = if (carDamage > 65f) Color.rgb(35, 35, 40) else Color.rgb(75, 75, 80)
+            spawnParticle(
+                carX + Random.nextFloat() * 5f - 2.5f,
+                carY + Random.nextFloat() * 5f - 2.5f,
+                carZ + 5f, 0f, 0f, 26f, 3.6f, smokeCol, 165
+            )
+            // %70 Üzeri Ağır Hasarda Motor Alev Alır!
+            if (carDamage > 70f) {
+                val fireCol = if (Random.nextBoolean()) Color.rgb(255, 110, 15) else Color.rgb(255, 205, 30)
+                spawnParticle(
+                    carX + cos(carYaw) * 9f + Random.nextFloat() * 4f - 2f,
+                    carY + sin(carYaw) * 9f + Random.nextFloat() * 4f - 2f,
+                    carZ + 4.5f, 0f, 0f, 38f, 3.2f, fireCol, 235
+                )
+            }
+        }
+
         for (p in particlePool) {
             if (!p.active) continue
             p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt
             p.size += 5f * dt
-            p.alpha -= (220 * dt).toInt()
+            p.alpha -= (215 * dt).toInt()
             if (p.alpha <= 0) p.active = false
         }
 
-        // AI Botları Güncelle
         if (botsEnabled) {
             updateBotsPhysics(dt)
         }
 
-        // Oyuncu Patlama Durumu -> Süre Bitince Güvenli Yol Noktasında Doğar
+        // PATLAMA VE 3B TAKLA ATMA (ROLLOVER) DURUMU
         if (isCrashing) {
             crashTimer -= dt
+            flipRollAngle += 11.2f * dt // Eski sürümdeki gibi takla atar
             carZ += carVZ * dt
             carVZ -= 235f * dt
             if (carZ < 0f) {
                 carZ = 0f
-                carVZ = abs(carVZ) * 0.45f
+                carVZ = abs(carVZ) * 0.52f
+                spawnDebris(carX, carY, 3, carColors[selectedColor])
+                triggerHaptic(40L, 235)
             }
+            carX += cos(velYaw) * speed * dt
+            carY += sin(velYaw) * speed * dt
             if (crashTimer <= 0f) {
                 respawnPlayerOnSafeRoad()
             }
             return
         }
 
-        // Sadece Crown Direksiyon Girişi
+        // Crown Direksiyon Girişi
         if (!isBezelDragging) {
             crownSteer *= 0.93f
         }
         steerInput = crownSteer
 
-        // Hız, Çim Yavaşlatması ve Turbo Artışı
+        // Hız ve İvme
         val baseMaxForward = when (selectedModel) { 0 -> 265f; 1 -> 285f; 2 -> 275f; else -> 305f }
         var maxForwardSpeed = if (isOffRoad) baseMaxForward * 0.56f else baseMaxForward
         if (turboActiveTimer > 0f) maxForwardSpeed *= 1.28f
@@ -2135,68 +2230,99 @@ class CrownDriftView(context: Context) : View(context) {
         velYaw += diff * driftGrip * dt
         camYaw += wrapAngle(carYaw - camYaw) * 6.5f * dt
 
-        carX += cos(velYaw) * speed * dt
-        carY += sin(velYaw) * speed * dt
+        carX += (cos(velYaw) * speed + knockVX) * dt
+        carY += (sin(velYaw) * speed + knockVY) * dt
+        knockVX *= (1f - 6.0f * dt)
+        knockVY *= (1f - 6.0f * dt)
 
         if (ghostEnabled && currentLapRecording.size < 1200) {
             currentLapRecording.add(GhostPose(carX, carY, carYaw))
         }
         ghostFrameIdx++
 
-        // Oyuncu - Bot Çarpışmaları
+        // 1. Oyuncu - Bot Çarpışma Fiziği (Savrulma, Kademeli Hasar ve Parça Düşmesi)
         if (botsEnabled) {
             for (bot in bots) {
                 if (bot.isCrashing) continue
                 val dx = carX - bot.x
                 val dy = carY - bot.y
                 val distSq = dx * dx + dy * dy
-                if (distSq < 484f && distSq > 0.01f) {
+                if (distSq < 529f && distSq > 0.01f) {
                     val dist = sqrt(distSq)
-                    val overlap = (22f - dist) * 0.55f
-                    val nx = dx / dist; val ny = dy / dist
-                    carX += nx * overlap; carY += ny * overlap
-                    bot.x -= nx * overlap; bot.y -= ny * overlap
+                    val pushAng = atan2(dy, dx)
+                    val overlap = 23f - dist
+                    carX += cos(pushAng) * overlap * 0.65f
+                    carY += sin(pushAng) * overlap * 0.65f
 
-                    if (shieldTimer <= 0f) {
-                        carDamage = (carDamage + 8f).coerceAtMost(100f)
-                        if (carDamage > 45f) bumperBroken = true
-                    }
-                    if (now - lastVibeTime > 85) {
-                        triggerHaptic(35L, 220)
+                    // Fiziksel İtme ve Savrulma
+                    knockVX += cos(pushAng) * 95f
+                    knockVY += sin(pushAng) * 95f
+                    bot.vx -= cos(pushAng) * 145f
+                    bot.vy -= sin(pushAng) * 145f
+                    impactTiltAngle = sign(sin(pushAng - carYaw)) * 0.32f
+
+                    if (now - lastVibeTime > 95) {
+                        val relImpact = (abs(speed - bot.speed) * 0.08f + 9f).coerceIn(8f, 22f)
+                        applyGradualCarDamage(relImpact, (carX + bot.x) * 0.5f, (carY + bot.y) * 0.5f)
+                        triggerHaptic(45L, 235)
                         lastVibeTime = now
+                        if (isCrashing) return
                     }
                 }
             }
         }
 
-        // Bina ve Yol Bariyerlerine Çarpma (3 Saniyelik Kalkan Aktifken Hasar Almaz!)
-        if (shieldTimer <= 0f) {
-            for (obs in obstacles) {
-                if (!obs.active) continue
-                val dx = carX - obs.x
-                val dy = carY - obs.y
-                val minD = obs.radius + 10.5f
-                if (dx * dx + dy * dy < minD * minD) {
-                    val ang = atan2(dy, dx)
-                    carX = obs.x + cos(ang) * minD
-                    carY = obs.y + sin(ang) * minD
-                    carDamage += speed * (if (obs.isRoadBarrier) 0.18f else 0.28f)
-                    if (carDamage > 35f) bumperBroken = true
-                    if (carDamage > 65f) spoilerBroken = true
-                    if (speed > 205f || carDamage >= 100f) {
-                        triggerPlayerExplosion()
-                        return
-                    } else {
-                        speed *= 0.45f
-                        spawnDebris(carX, carY, 5, carColors[selectedColor])
-                        triggerHaptic(70L, 250)
-                        break
+        // 2. Yol Engelleri ve Çim Engelleri Çarpışma Mekaniği (ASLA ANINDA PATLATMAZ!)
+        for (obs in obstacles) {
+            if (!obs.active) continue
+            val dx = carX - obs.x
+            val dy = carY - obs.y
+            val minD = obs.radius + 11f
+            if (dx * dx + dy * dy < minD * minD) {
+                val pushAng = atan2(dy, dx)
+
+                if (obs.isRoadBarrier) {
+                    // YOL BARİYERİ ÇARPIŞMASI: Bariyer kırılıp parçalanır, araç yavaşlar ve hafif savrulur!
+                    obs.active = false
+                    obs.respawnTimer = 12f
+                    speed *= 0.62f
+                    knockVX += cos(pushAng) * 80f
+                    knockVY += sin(pushAng) * 80f
+                    velYaw += (Random.nextFloat() - 0.5f) * 0.35f
+                    impactTiltAngle = (Random.nextFloat() - 0.5f) * 0.38f
+
+                    // Kırılan bariyerin turuncu ve beyaz parçaları etrafa dağılır
+                    spawnDebris(obs.x, obs.y, 8, Color.rgb(255, 125, 20))
+                    val barrierDmg = (speed * 0.06f + 8f).coerceIn(8f, 18f)
+                    applyGradualCarDamage(barrierDmg, obs.x, obs.y)
+                    triggerHaptic(55L, 240)
+                    lastVibeTime = now
+                    if (isCrashing) return
+                } else {
+                    // ÇİMDEKİ AĞAÇ / BİNA ÇARPIŞMASI: Fiziksel sekme, yavaşlama ve şiddete göre kademeli hasar
+                    carX = obs.x + cos(pushAng) * minD
+                    carY = obs.y + sin(pushAng) * minD
+
+                    val impactSeverity = (speed / 280f).coerceIn(0.2f, 1.1f)
+                    speed *= 0.45f
+                    knockVX += cos(pushAng) * 130f * impactSeverity
+                    knockVY += sin(pushAng) * 130f * impactSeverity
+                    velYaw = wrapAngle(velYaw + wrapAngle(pushAng - velYaw) * 0.45f)
+                    impactTiltAngle = sign(sin(pushAng - carYaw)) * 0.42f
+
+                    if (now - lastVibeTime > 95) {
+                        val obsDmg = (14f + impactSeverity * 22f) // 18..38 arası kademeli hasar (Tek vuruşta patlatmaz!)
+                        applyGradualCarDamage(obsDmg, carX, carY)
+                        triggerHaptic(75L, 255)
+                        lastVibeTime = now
+                        if (isCrashing) return
                     }
                 }
+                break
             }
         }
 
-        // Hızlı Yerel Yol Noktası Güncellemesi
+        // Yerel Yol Noktası Güncellemesi
         currentWp = findNearestWaypointLocal(carX, carY, currentWp)
         val tp = trackPts[currentWp]
         val bestDist = hypot(carX - tp.x, carY - tp.y)
@@ -2251,7 +2377,6 @@ class CrownDriftView(context: Context) : View(context) {
         }
         playerProgress = (lap - 1) * total + currentWp.toFloat()
 
-        // 4 Araç Arasında Canlı Sıralama (1/4 .. 4/4)
         var pos = 1
         if (botsEnabled) {
             for (bot in bots) {
@@ -2260,7 +2385,7 @@ class CrownDriftView(context: Context) : View(context) {
         }
         racePosition = pos
 
-        // Drift Puanlama, TURBO DOLDURMA ve Lastik İzleri
+        // Drift Puanlama, Turbo Doldurma ve Lastik İzleri
         val slip = abs(wrapAngle(carYaw - velYaw))
         val backX = carX - cos(carYaw) * 12f
         val backY = carY - sin(carYaw) * 12f
@@ -2280,7 +2405,6 @@ class CrownDriftView(context: Context) : View(context) {
                 }
                 score += slip * 540f * driftCombo * dt
 
-                // Drift Yaptıkça Turbo Göstergesi Dolar!
                 if (turboActiveTimer <= 0f && turboMeter < 100f) {
                     turboMeter = (turboMeter + slip * 36f * dt).coerceAtMost(100f)
                 }
@@ -2310,10 +2434,10 @@ class CrownDriftView(context: Context) : View(context) {
         }
     }
 
-    // ==================== OYUN İÇİ HUD: YANDA DUR BUTONU, TURBO VE AKTİF SİLAH SİMGELERİ ====================
+    // ==================== OYUN İÇİ HUD: HASAR ÇUBUĞU, DUR, TURBO VE AKTİF ÖZELLİKLER ====================
     private fun drawGameHud(canvas: Canvas, cx: Float, cy: Float, R: Float) {
-        // 1. Sol-Üst Skor ve Sıralama Kutusu
-        tempRect.set(cx - R * 0.56f, cy - R * 0.62f, cx - R * 0.06f, cy - R * 0.26f)
+        // 1. Sol-Üst Skor, Sıralama ve Kademeli Hasar Kutusu
+        tempRect.set(cx - R * 0.56f, cy - R * 0.62f, cx - R * 0.06f, cy - R * 0.25f)
         paint.style = Paint.Style.FILL
         paint.color = Color.argb(180, 14, 20, 26)
         canvas.drawRoundRect(tempRect, R * 0.07f, R * 0.07f, paint)
@@ -2326,10 +2450,21 @@ class CrownDriftView(context: Context) : View(context) {
         canvas.drawText("L$lap/$totalLaps • ${tenths / 10}.${tenths % 10}s$posStr", tempRect.centerX(), cy - R * 0.49f, paint)
 
         paint.color = if (isOffRoad) Color.rgb(255, 195, 30) else Color.rgb(0, 225, 255)
-        paint.textSize = R * 0.12f
-        canvas.drawText("${score.toInt()}", tempRect.centerX(), cy - R * 0.32f, paint)
+        paint.textSize = R * 0.115f
+        canvas.drawText("${score.toInt()}", tempRect.centerX(), cy - R * 0.33f, paint)
 
-        // 2. Güvenli ÇIKIŞ (ÇIK) Butonu (Mini Haritanın Sol Yanında)
+        // Kademeli Hasar Çubuğu (Kutunun Alt Kenarında)
+        if (carDamage > 0f) {
+            val barW = (tempRect.width() - R * 0.08f) * (carDamage / 100f)
+            paint.color = when {
+                carDamage > 70f -> Color.rgb(255, 45, 45)
+                carDamage > 35f -> Color.rgb(255, 165, 20)
+                else -> Color.rgb(255, 220, 40)
+            }
+            canvas.drawRoundRect(tempRect.left + R * 0.04f, tempRect.bottom - R * 0.032f, tempRect.left + R * 0.04f + barW, tempRect.bottom - R * 0.01f, 4f, 4f, paint)
+        }
+
+        // 2. Güvenli ÇIKIŞ (ÇIK) Butonu
         val exitBtnX = cx + R * 0.08f
         val exitBtnY = cy - R * 0.42f
         paint.color = Color.argb(200, 185, 35, 45)
@@ -2378,7 +2513,7 @@ class CrownDriftView(context: Context) : View(context) {
         paint.color = Color.rgb(60, 255, 90)
         canvas.drawCircle(mapCX + carX * miniScale, mapCY + carY * miniScale, R * 0.026f, paint)
 
-        // 4. SOL-ALT İÇ BÖLGE DUR / SÜR BUTONU (Arabanın Üzerini Kapatmaz!)
+        // 4. SOL-ALT İÇ BÖLGE DUR / SÜR BUTONU (Arabanın Üzerini Kapatmaz)
         val stopBtnX = cx - R * 0.44f
         val stopBtnY = cy + R * 0.28f
         val stopRad = R * 0.125f
@@ -2404,7 +2539,6 @@ class CrownDriftView(context: Context) : View(context) {
         }
         canvas.drawCircle(turboBtnX, turboBtnY, turboRad, paint)
 
-        // Turbo Doluluk Halkası
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = R * 0.022f
         paint.color = if (isTurboReady || isTurboActive) Color.WHITE else Color.rgb(0, 215, 255)
@@ -2422,18 +2556,18 @@ class CrownDriftView(context: Context) : View(context) {
         }
         canvas.drawText(turboLabel, turboBtnX, turboBtnY + R * 0.020f, paint)
 
-        // 6. TURBO BUTONUNUN HEMEN ALTINDA AKTİF ÖZELLİK VE SİLAH GÖSTERGELERİ
+        // 6. TURBO BUTONUNUN ALTINDA AKTİF SİLAH VE ÖZELLİK GÖSTERGELERİ
         var badgeY = turboBtnY + turboRad + R * 0.06f
         if (activeWeaponType != 0 && weaponTimer > 0f) {
             val wName = when (activeWeaponType) {
                 1 -> "FÜZE x$weaponAmmo"
-                2 -> "TUZAK Hazır"
+                2 -> "ŞOK DALGASI"
                 3 -> "YAVAŞLATMA"
                 else -> "TARET Aktif"
             }
             val wCol = when (activeWeaponType) {
                 1 -> Color.rgb(255, 70, 50)
-                2 -> Color.rgb(255, 185, 25)
+                2 -> Color.rgb(255, 205, 25)
                 3 -> Color.rgb(185, 65, 255)
                 else -> Color.rgb(0, 225, 255)
             }
@@ -2441,7 +2575,6 @@ class CrownDriftView(context: Context) : View(context) {
             paint.color = Color.argb(200, 16, 22, 30)
             canvas.drawRoundRect(tempRect, R * 0.04f, R * 0.04f, paint)
 
-            // Kalan Süre Çubuğu
             val ratio = (weaponTimer / weaponMaxTimer).coerceIn(0f, 1f)
             paint.color = wCol
             canvas.drawRoundRect(tempRect.left + 4f, tempRect.bottom - 5f, tempRect.left + 4f + (tempRect.width() - 8f) * ratio, tempRect.bottom - 1f, 3f, 3f, paint)
@@ -2462,7 +2595,7 @@ class CrownDriftView(context: Context) : View(context) {
             canvas.drawText("KALKAN ${shSec / 10}.${shSec % 10}s", turboBtnX, badgeY + R * 0.014f, paint)
         }
 
-        // 7. Turnuva Başlangıç Geri Sayımı (3, 2, 1, BAŞLA!) ve Bildirimler
+        // 7. Turnuva Başlangıç Geri Sayımı ve Bildirimler
         if (countdownTimer > 0f) {
             val countNum = ceil(countdownTimer - 0.4f).toInt()
             val text = if (countNum > 0) "$countNum" else "BAŞLA!"
@@ -2471,8 +2604,13 @@ class CrownDriftView(context: Context) : View(context) {
             canvas.drawText(text, cx, cy - R * 0.02f, paint)
         } else if (isCrashing) {
             paint.color = Color.rgb(255, 65, 55)
-            paint.textSize = R * 0.085f
-            canvas.drawText("PATLADI! YOLA KONUYOR", cx, cy - R * 0.08f, paint)
+            paint.textSize = R * 0.082f
+            val sec = (crashTimer * 10f).toInt().coerceAtLeast(0)
+            canvas.drawText("PATLADI! ${sec / 10}.${sec % 10}s", cx, cy - R * 0.08f, paint)
+        } else if (respawnBannerTimer > 0f) {
+            paint.color = Color.rgb(80, 255, 140)
+            paint.textSize = R * 0.075f
+            canvas.drawText("GÜVENLİ YOLDA DOĞDU", cx, cy - R * 0.08f, paint)
         }
 
         // 8. Alt Kenar 19 Noktalı Crown Direksiyon Göstergesi
@@ -2625,7 +2763,7 @@ class CrownDriftView(context: Context) : View(context) {
         val savedX = carX; val savedY = carY; val savedCam = camYaw
         carX = 0f; carY = 0f; camYaw = 0f
         camCosYaw = 1f; camSinYaw = 0f
-        drawSport3DCar(canvas, cx, cy - R * 0.34f, R * 1.15f, 18f, 0f, 35f, garagePreviewYaw, carColors[selectedColor], selectedModel, isGhost = false, isPlayer = false)
+        drawSport3DCar(canvas, cx, cy - R * 0.34f, R * 1.15f, 18f, 0f, 35f, garagePreviewYaw, 0f, carColors[selectedColor], selectedModel, isGhost = false, isPlayer = false)
         carX = savedX; carY = savedY; camYaw = savedCam
 
         tempRect.set(cx - R * 0.56f, cy - R * 0.07f, cx - R * 0.04f, cy + R * 0.11f)
