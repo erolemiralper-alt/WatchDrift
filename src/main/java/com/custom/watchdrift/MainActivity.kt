@@ -213,8 +213,6 @@ class CrownDriftView(context: Context) : View(context) {
     private val prefs = context.getSharedPreferences("crowndrift_v7", Context.MODE_PRIVATE)
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val polyPath = Path()
-    private val shieldOuterPath = Path()
-    private val shieldInnerPath = Path()
     private val arcPath = Path()
     private val miniPath = Path()
     private val tempRect = RectF()
@@ -867,45 +865,35 @@ class CrownDriftView(context: Context) : View(context) {
         }
     }
 
-    // ==================== HATA 1 DÜZELTMESİ: SEGMENT BAZLI YEREL WAYPOINT VE DİK İZDÜŞÜM HESABI ====================
-    private fun pointToSegmentDistSq(px: Float, py: Float, ax: Float, ay: Float, bx: Float, by: Float): Float {
-        val vx = bx - ax
-        val vy = by - ay
-        val lenSq = (vx * vx + vy * vy).coerceAtLeast(1f)
-        val t = (((px - ax) * vx + (py - ay) * vy) / lenSq).coerceIn(0f, 1f)
-        val dx = px - (ax + vx * t)
-        val dy = py - (ay + vy * t)
-        return dx * dx + dy * dy
-    }
-
+    // Performans Optimizasyonu: Yerel Waypoint Araması + Gerçek Segment Dik Mesafe Hesabı
     private fun findNearestWaypointLocal(px: Float, py: Float, hintWp: Int, forceFullScan: Boolean = false): Int {
         val n = trackPts.size
         if (n == 0) return 0
-        val baseWp = (hintWp % n + n) % n
-        var best = baseWp
+        var best = (hintWp % n + n) % n
         var bestD = Float.MAX_VALUE
 
         if (!forceFullScan) {
-            for (k in -18..24) {
-                val idx = (baseWp + k + n) % n
-                val p0 = trackPts[idx]
-                val p1 = trackPts[(idx + 1) % n]
-                val d = pointToSegmentDistSq(px, py, p0.x, p0.y, p1.x, p1.y)
+            for (k in -20..26) {
+                val idx = (best + k + n) % n
+                val p = trackPts[idx]
+                val dx = p.x - px
+                val dy = p.y - py
+                val d = dx * dx + dy * dy
                 if (d < bestD) {
                     bestD = d
                     best = idx
                 }
             }
-            val localLimit = roadHalfWidth * 1.45f
-            if (bestD <= localLimit * localLimit) {
+            if (bestD <= (roadHalfWidth * 1.15f) * (roadHalfWidth * 1.15f)) {
                 return best
             }
         }
 
         for (i in 0 until n) {
-            val p0 = trackPts[i]
-            val p1 = trackPts[(i + 1) % n]
-            val d = pointToSegmentDistSq(px, py, p0.x, p0.y, p1.x, p1.y)
+            val p = trackPts[i]
+            val dx = p.x - px
+            val dy = p.y - py
+            val d = dx * dx + dy * dy
             if (d < bestD) {
                 bestD = d
                 best = i
@@ -917,17 +905,22 @@ class CrownDriftView(context: Context) : View(context) {
     private fun computeCrossTrackDistance(px: Float, py: Float, wpIdx: Int): Float {
         val n = trackPts.size
         if (n == 0) return 0f
-        val idx0 = (wpIdx % n + n) % n
-        val pPrev = trackPts[(idx0 - 1 + n) % n]
-        val p0 = trackPts[idx0]
-        val p1 = trackPts[(idx0 + 1) % n]
-        val p2 = trackPts[(idx0 + 2) % n]
+        val p0 = trackPts[wpIdx]
+        val p1 = trackPts[(wpIdx + 1) % n]
+        val vx1 = p1.x - p0.x
+        val vy1 = p1.y - p0.y
+        val lenSq1 = (vx1 * vx1 + vy1 * vy1).coerceAtLeast(1f)
+        val t1 = (((px - p0.x) * vx1 + (py - p0.y) * vy1) / lenSq1).coerceIn(0f, 1f)
+        val d1 = hypot(px - (p0.x + vx1 * t1), py - (p0.y + vy1 * t1))
 
-        val dPrevSq = pointToSegmentDistSq(px, py, pPrev.x, pPrev.y, p0.x, p0.y)
-        val dCurrSq = pointToSegmentDistSq(px, py, p0.x, p0.y, p1.x, p1.y)
-        val dNextSq = pointToSegmentDistSq(px, py, p1.x, p1.y, p2.x, p2.y)
+        val pPrev = trackPts[(wpIdx - 1 + n) % n]
+        val vx2 = p0.x - pPrev.x
+        val vy2 = p0.y - pPrev.y
+        val lenSq2 = (vx2 * vx2 + vy2 * vy2).coerceAtLeast(1f)
+        val t2 = (((px - pPrev.x) * vx2 + (py - pPrev.y) * vy2) / lenSq2).coerceIn(0f, 1f)
+        val d2 = hypot(px - (pPrev.x + vx2 * t2), py - (pPrev.y + vy2 * t2))
 
-        return sqrt(min(dPrevSq, min(dCurrSq, dNextSq)))
+        return min(d1, d2)
     }
 
     private fun computeContinuousProgress(px: Float, py: Float, wpIdx: Int, lapsDone: Int): Float {
@@ -1250,7 +1243,7 @@ class CrownDriftView(context: Context) : View(context) {
         pr.isMissile = isMissile
         pr.x = px
         pr.y = py
-        pr.z = if (isMissile) carZ + 9.0f else carZ + 5.8f
+        pr.z = if (isMissile) 8.5f else 5.5f
         pr.yaw = yaw
         val projSpeed = if (isMissile) 520f else 620f
         pr.vx = cos(yaw) * projSpeed
@@ -1295,8 +1288,7 @@ class CrownDriftView(context: Context) : View(context) {
                         if (dist in 25f..430f) {
                             val dot = (dx / dist) * fwdX + (dy / dist) * fwdY
                             if (dot > 0.85f) {
-                                // Tavan üzerindeki roket konumundan ateşlenir
-                                spawnProjectile(isMissile = true, carX + fwdX * 6f, carY + fwdY * 6f, carYaw)
+                                spawnProjectile(isMissile = true, carX + fwdX * 18f, carY + fwdY * 18f, carYaw)
                                 showStatusToast("FÜZE ATEŞLENDİ!", 1.4f)
                                 triggerHaptic(65L, 250)
                                 activePower = POWER_NONE
@@ -2058,7 +2050,6 @@ class CrownDriftView(context: Context) : View(context) {
         canvas.drawPath(polyPath, paint)
     }
 
-    // ==================== HATA 2 DÜZELTMESİ: KAMERA BAKIŞ YÖNÜNE GÖRE DOT-PRODUCT BACKFACE CULLING VE DERİNLİK SIRALAMASI ====================
     private fun draw3DBox(
         canvas: Canvas, cx: Float, cy: Float, R: Float,
         bx: Float, by: Float, bz: Float,
@@ -2081,90 +2072,28 @@ class CrownDriftView(context: Context) : View(context) {
         val toBoxX = bx - eyeX
         val toBoxY = by - eyeY
 
-        // Kutu eksenlerine göre kamera bakış vektörü dot-product hesabı
-        val dotFwd = toBoxX * c + toBoxY * s
         val dotRight = toBoxX * (-s) + toBoxY * c
-
-        // Boyuna yüzey (Ön veya Arka) görünürlük kontrolü ve kameraya olan uzaklık karesi
-        var hasLongFace = false
-        var isRearVisible = false
-        var longDistSq = 0f
-        if (dotFwd > halfL) {
-            hasLongFace = true
-            isRearVisible = true
-            val dx = (bx - fx) - eyeX
-            val dy = (by - fy) - eyeY
-            longDistSq = dx * dx + dy * dy
-        } else if (dotFwd < -halfL) {
-            hasLongFace = true
-            isRearVisible = false
-            val dx = (bx + fx) - eyeX
-            val dy = (by + fy) - eyeY
-            longDistSq = dx * dx + dy * dy
+        if (dotRight > 0f) {
+            drawQuad3D(canvas, cx, cy, R, frX, frY, bz, rrX, rrY, bz, rrX, rrY, topZ, frX, frY, topZ, sideColor)
+            drawQuad3D(canvas, cx, cy, R, flX, flY, bz, rlX, rlY, bz, rlX, rlY, topZ, flX, flY, topZ, sideColor)
+        } else {
+            drawQuad3D(canvas, cx, cy, R, flX, flY, bz, rlX, rlY, bz, rlX, rlY, topZ, flX, flY, topZ, sideColor)
+            drawQuad3D(canvas, cx, cy, R, frX, frY, bz, rrX, rrY, bz, rrX, rrY, topZ, frX, frY, topZ, sideColor)
         }
 
-        // Enine yüzey (Sol veya Sağ yan) görünürlük kontrolü ve kameraya olan uzaklık karesi
-        var hasLatFace = false
-        var isLeftVisible = false
-        var latDistSq = 0f
-        if (dotRight > halfW) {
-            hasLatFace = true
-            isLeftVisible = true
-            val dx = (bx - rx) - eyeX
-            val dy = (by - ry) - eyeY
-            latDistSq = dx * dx + dy * dy
-        } else if (dotRight < -halfW) {
-            hasLatFace = true
-            isLeftVisible = false
-            val dx = (bx + rx) - eyeX
-            val dy = (by + ry) - eyeY
-            latDistSq = dx * dx + dy * dy
+        val dotFwd = toBoxX * c + toBoxY * s
+        if (dotFwd >= 0f) {
+            drawQuad3D(canvas, cx, cy, R, flX, flY, bz, frX, frY, bz, frX, frY, topZ, flX, flY, topZ, sideColor)
+            drawQuad3D(canvas, cx, cy, R, rlX, rlY, bz, rrX, rrY, bz, rrX, rrY, topZ, rlX, rlY, topZ, rearColor)
+        } else {
+            drawQuad3D(canvas, cx, cy, R, rlX, rlY, bz, rrX, rrY, bz, rrX, rrY, topZ, rlX, rlY, topZ, rearColor)
+            drawQuad3D(canvas, cx, cy, R, flX, flY, bz, frX, frY, bz, frX, frY, topZ, flX, flY, topZ, sideColor)
         }
 
-        // Görünür dikey yüzeyleri kameraya uzaktan yakına doğru sıralayarak çiz
-        if (hasLongFace && hasLatFace) {
-            if (longDistSq >= latDistSq) {
-                if (isRearVisible) {
-                    drawQuad3D(canvas, cx, cy, R, rlX, rlY, bz, rrX, rrY, bz, rrX, rrY, topZ, rlX, rlY, topZ, rearColor)
-                } else {
-                    drawQuad3D(canvas, cx, cy, R, flX, flY, bz, frX, frY, bz, frX, frY, topZ, flX, flY, topZ, sideColor)
-                }
-                if (isLeftVisible) {
-                    drawQuad3D(canvas, cx, cy, R, flX, flY, bz, rlX, rlY, bz, rlX, rlY, topZ, flX, flY, topZ, sideColor)
-                } else {
-                    drawQuad3D(canvas, cx, cy, R, frX, frY, bz, rrX, rrY, bz, rrX, rrY, topZ, frX, frY, topZ, sideColor)
-                }
-            } else {
-                if (isLeftVisible) {
-                    drawQuad3D(canvas, cx, cy, R, flX, flY, bz, rlX, rlY, bz, rlX, rlY, topZ, flX, flY, topZ, sideColor)
-                } else {
-                    drawQuad3D(canvas, cx, cy, R, frX, frY, bz, rrX, rrY, bz, rrX, rrY, topZ, frX, frY, topZ, sideColor)
-                }
-                if (isRearVisible) {
-                    drawQuad3D(canvas, cx, cy, R, rlX, rlY, bz, rrX, rrY, bz, rrX, rrY, topZ, rlX, rlY, topZ, rearColor)
-                } else {
-                    drawQuad3D(canvas, cx, cy, R, flX, flY, bz, frX, frY, bz, frX, frY, topZ, flX, flY, topZ, sideColor)
-                }
-            }
-        } else if (hasLongFace) {
-            if (isRearVisible) {
-                drawQuad3D(canvas, cx, cy, R, rlX, rlY, bz, rrX, rrY, bz, rrX, rrY, topZ, rlX, rlY, topZ, rearColor)
-            } else {
-                drawQuad3D(canvas, cx, cy, R, flX, flY, bz, frX, frY, bz, frX, frY, topZ, flX, flY, topZ, sideColor)
-            }
-        } else if (hasLatFace) {
-            if (isLeftVisible) {
-                drawQuad3D(canvas, cx, cy, R, flX, flY, bz, rlX, rlY, bz, rlX, rlY, topZ, flX, flY, topZ, sideColor)
-            } else {
-                drawQuad3D(canvas, cx, cy, R, frX, frY, bz, rrX, rrY, bz, rrX, rrY, topZ, frX, frY, topZ, sideColor)
-            }
-        }
-
-        // Üst yüzey (kamera z=138'de yukarıda olduğu için en son çizilir)
         drawQuad3D(canvas, cx, cy, R, flX, flY, topZ, frX, frY, topZ, rrX, rrY, topZ, rlX, rlY, topZ, topColor)
     }
 
-    // ==================== 4 FARKLI 3B SPOR ARAÇ VE ÖZGÜN 3B SİLAH/EKİPMAN MODELLERİ ====================
+    // ==================== 4 FARKLI 3B SPOR ARAÇ MODELİ TASARIMI ====================
     private fun drawSport3DCar(
         canvas: Canvas, cx: Float, cy: Float, R: Float,
         x: Float, y: Float, zOffset: Float, yaw: Float,
@@ -2202,205 +2131,110 @@ class CrownDriftView(context: Context) : View(context) {
         }
 
         val bz = zOffset + 1.4f
-        val eyeX = carX - cos(camYaw) * 98f
-        val eyeY = carY - sin(camYaw) * 98f
-        val dotRight = (x - eyeX) * rxVec + (y - eyeY) * ryVec
-        val dotFwd = (x - eyeX) * c + (y - eyeY) * s
 
-        val m = modelIdx % 4
-        val wxF = 9.8f
-        val wxR = -9.8f
-        val wyOff = if (m == 3) 10.4f else 9.4f
-        val wWidth = if (m == 3) 2.2f else 1.7f
-        val steerVisual = if (isPlayer) steerInput * 0.35f else 0f
-        val farSide = if (dotRight >= 0f) 1f else -1f
-        val nearSide = -farSide
-
-        // 1. Kameraya uzak taraftaki tekerlekler (Ön -> Arka)
+        // 4 Tekerlek
         if (!isGhost) {
-            draw3DBox(canvas, cx, cy, R, x + c * wxF + rxVec * (wyOff * farSide), y + s * wxF + ryVec * (wyOff * farSide), 0.5f + zOffset, 3.5f, wWidth, 3.6f, yaw + steerVisual, wheelCol, wheelCol, wheelCol)
-            draw3DBox(canvas, cx, cy, R, x + c * wxR + rxVec * (wyOff * farSide), y + s * wxR + ryVec * (wyOff * farSide), 0.5f + zOffset, 3.7f, wWidth, 3.8f, yaw, wheelCol, wheelCol, wheelCol)
+            val wxF = 9.8f; val wxR = -9.8f
+            val wyOff = if (modelIdx == 3) 10.4f else 9.4f
+            val wWidth = if (modelIdx == 3) 2.2f else 1.7f
+            val steerVisual = if (isPlayer) steerInput * 0.35f else 0f
+            draw3DBox(canvas, cx, cy, R, x + c * wxF - rxVec * wyOff, y + s * wxF - ryVec * wyOff, 0.5f + zOffset, 3.5f, wWidth, 3.6f, yaw + steerVisual, wheelCol, wheelCol, wheelCol)
+            draw3DBox(canvas, cx, cy, R, x + c * wxF + rxVec * wyOff, y + s * wxF + ryVec * wyOff, 0.5f + zOffset, 3.5f, wWidth, 3.6f, yaw + steerVisual, wheelCol, wheelCol, wheelCol)
+            draw3DBox(canvas, cx, cy, R, x + c * wxR - rxVec * wyOff, y + s * wxR - ryVec * wyOff, 0.5f + zOffset, 3.7f, wWidth, 3.8f, yaw, wheelCol, wheelCol, wheelCol)
+            draw3DBox(canvas, cx, cy, R, x + c * wxR + rxVec * wyOff, y + s * wxR + ryVec * wyOff, 0.5f + zOffset, 3.7f, wWidth, 3.8f, yaw, wheelCol, wheelCol, wheelCol)
         }
 
-        // 2. Araç alt gövde parçaları (Kesin Uzaktan Yakına Sıralama: Ön Burun -> Ana Gövde)
-        when (m) {
+        when (modelIdx % 4) {
             0 -> {
-                val bodyLen = if (isPlayer && bumperBroken) 12.8f else 14.5f
+                val bodyLen = if (isPlayer && bumperBroken) 13.5f else 15.8f
                 if (!(isPlayer && bumperBroken)) {
-                    // Ön Burun
-                    draw3DBox(canvas, cx, cy, R, x + c * 12.2f, y + s * 12.2f, bz, 3.8f, 8.2f, 2.9f, yaw, topCol, sideCol, wheelCol)
+                    draw3DBox(canvas, cx, cy, R, x + c * 11.2f, y + s * 11.2f, bz + 0.4f, 4.8f, 8.2f, 2.8f, yaw, topCol, sideCol, wheelCol)
                 }
-                // Ana Gövde
-                draw3DBox(canvas, cx, cy, R, x - c * 1.0f, y - s * 1.0f, bz, bodyLen, 8.8f, 4.2f, yaw, topCol, sideCol, rearCol)
+                draw3DBox(canvas, cx, cy, R, x, y, bz, bodyLen, 8.8f, 4.3f, yaw, topCol, sideCol, rearCol)
+                draw3DBox(canvas, cx, cy, R, x - c * 1.5f, y - s * 1.5f, bz + 4.3f, 7.6f, 6.8f, 3.7f, yaw, topCol, glassCol, glassCol)
+                if (!(isPlayer && spoilerBroken)) {
+                    val spX = x - c * 14.0f; val spY = y - s * 14.0f
+                    draw3DBox(canvas, cx, cy, R, spX, spY, bz + 6.4f, 2.0f, 9.4f, 1.1f, yaw, wheelCol, sideCol, rearCol)
+                }
             }
 
             1 -> {
-                val bodyLen = if (isPlayer && bumperBroken) 12.5f else 14.2f
+                val bodyLen = if (isPlayer && bumperBroken) 14.0f else 16.8f
                 if (!(isPlayer && bumperBroken)) {
-                    // Ön Burun
-                    draw3DBox(canvas, cx, cy, R, x + c * 12.5f, y + s * 12.5f, bz, 4.5f, 8.6f, 2.3f, yaw, topCol, sideCol, wheelCol)
+                    draw3DBox(canvas, cx, cy, R, x + c * 12.0f, y + s * 12.0f, bz, 5.5f, 8.8f, 2.1f, yaw, topCol, sideCol, wheelCol)
                 }
-                // Ana Gövde (Yan hava kanalları kabinin üstünü kapatmaması için ana gövdeyle bütünleşik çizilir)
-                draw3DBox(canvas, cx, cy, R, x - c * 1.2f, y - s * 1.2f, bz, bodyLen, 9.8f, 3.5f, yaw, topCol, sideCol, rearCol)
+                draw3DBox(canvas, cx, cy, R, x - c * 1.0f, y - s * 1.0f, bz, bodyLen * 0.85f, 9.8f, 3.4f, yaw, topCol, sideCol, rearCol)
+                draw3DBox(canvas, cx, cy, R, x + c * 1.0f, y + s * 1.0f, bz + 3.4f, 8.2f, 6.4f, 2.9f, yaw, topCol, glassCol, rearCol)
+                draw3DBox(canvas, cx, cy, R, x - c * 4.5f, y - s * 4.5f, bz + 2.2f, 5.0f, 10.2f, 1.8f, yaw, sideCol, wheelCol, rearCol)
+                if (!(isPlayer && spoilerBroken)) {
+                    draw3DBox(canvas, cx, cy, R, x - c * 14.8f, y - s * 14.8f, bz + 4.8f, 2.2f, 10.2f, 0.9f, yaw, rearCol, sideCol, wheelCol)
+                }
             }
 
             2 -> {
-                val bodyLen = if (isPlayer && bumperBroken) 12.6f else 14.2f
-                if (!(isPlayer && bumperBroken)) {
-                    // Ön Burun
-                    draw3DBox(canvas, cx, cy, R, x + c * 12.4f, y + s * 12.4f, bz + 0.2f, 4.2f, 8.8f, 3.6f, yaw, topCol, sideCol, chromeCol)
-                }
-                // Ana Gövde
-                draw3DBox(canvas, cx, cy, R, x - c * 1.2f, y - s * 1.2f, bz + 0.2f, bodyLen, 9.0f, 4.4f, yaw, topCol, sideCol, rearCol)
-                if (!(isPlayer && activePower == POWER_FRONT_GUN)) {
-                    draw3DBox(canvas, cx, cy, R, x + c * 8.2f, y + s * 8.2f, bz + 4.6f, 3.0f, 3.0f, 1.8f, yaw, chromeCol, wheelCol, chromeCol)
+                val bodyLen = if (isPlayer && bumperBroken) 14.2f else 16.5f
+                draw3DBox(canvas, cx, cy, R, x, y, bz + 0.4f, bodyLen, 9.0f, 4.6f, yaw, topCol, sideCol, rearCol)
+                draw3DBox(canvas, cx, cy, R, x + c * 7.5f, y + s * 7.5f, bz + 5.0f, 3.8f, 3.2f, 2.4f, yaw, chromeCol, wheelCol, chromeCol)
+                draw3DBox(canvas, cx, cy, R, x - c * 3.8f, y - s * 3.8f, bz + 5.0f, 6.8f, 7.2f, 3.6f, yaw, topCol, glassCol, glassCol)
+                if (!(isPlayer && spoilerBroken)) {
+                    draw3DBox(canvas, cx, cy, R, x - c * 15.2f, y - s * 15.2f, bz + 5.0f, 1.4f, 8.8f, 1.8f, yaw, rearCol, sideCol, rearCol)
                 }
             }
 
             else -> {
                 if (!(isPlayer && bumperBroken)) {
-                    // Ön Kanat ve Burun
-                    draw3DBox(canvas, cx, cy, R, x + c * 15.8f, y + s * 15.8f, bz - 0.3f, 2.0f, 10.4f, 1.1f, yaw, chromeCol, topCol, sideCol)
+                    draw3DBox(canvas, cx, cy, R, x + c * 16.2f, y + s * 16.2f, bz - 0.4f, 2.2f, 10.6f, 1.1f, yaw, chromeCol, topCol, sideCol)
                 }
-                draw3DBox(canvas, cx, cy, R, x + c * 9.5f, y + s * 9.5f, bz + 0.2f, 5.2f, 3.8f, 2.8f, yaw, topCol, sideCol, rearCol)
-                // Ana Gövde
-                draw3DBox(canvas, cx, cy, R, x - c * 2.2f, y - s * 2.2f, bz, 10.8f, 7.8f, 3.2f, yaw, topCol, sideCol, rearCol)
+                draw3DBox(canvas, cx, cy, R, x + c * 4.5f, y + s * 4.5f, bz + 0.4f, 12.5f, 3.4f, 3.0f, yaw, topCol, sideCol, rearCol)
+                draw3DBox(canvas, cx, cy, R, x - c * 1.5f, y - s * 1.5f, bz, 11.5f, 7.6f, 3.2f, yaw, topCol, sideCol, rearCol)
+                draw3DBox(canvas, cx, cy, R, x - c * 1.0f, y - s * 1.0f, bz + 3.2f, 4.5f, 3.2f, 3.2f, yaw, glassCol, glassCol, rearCol)
+                draw3DBox(canvas, cx, cy, R, x - c * 8.0f, y - s * 8.0f, bz + 3.2f, 5.0f, 0.8f, 3.6f, yaw, topCol, sideCol, rearCol)
+                if (!(isPlayer && spoilerBroken)) {
+                    draw3DBox(canvas, cx, cy, R, x - c * 14.8f, y - s * 14.8f, bz + 5.8f, 2.6f, 9.8f, 1.4f, yaw, chromeCol, topCol, rearCol)
+                }
             }
         }
 
-        // 3. Kameraya yakın taraftaki tekerlekler
-        if (!isGhost) {
-            draw3DBox(canvas, cx, cy, R, x + c * wxF + rxVec * (wyOff * nearSide), y + s * wxF + ryVec * (wyOff * nearSide), 0.5f + zOffset, 3.5f, wWidth, 3.6f, yaw + steerVisual, wheelCol, wheelCol, wheelCol)
-            draw3DBox(canvas, cx, cy, R, x + c * wxR + rxVec * (wyOff * nearSide), y + s * wxR + ryVec * (wyOff * nearSide), 0.5f + zOffset, 3.7f, wWidth, 3.8f, yaw, wheelCol, wheelCol, wheelCol)
-        }
-
-        // 4. Kabin (Ön Burun ve Ana Gövdeden SONRA, Spoiler'dan ÖNCE çizilir)
-        when (m) {
-            0 -> draw3DBox(canvas, cx, cy, R, x - c * 3.0f, y - s * 3.0f, bz + 4.2f, 5.8f, 6.8f, 3.4f, yaw, topCol, glassCol, glassCol)
-            1 -> draw3DBox(canvas, cx, cy, R, x - c * 2.8f, y - s * 2.8f, bz + 3.5f, 5.8f, 6.4f, 2.8f, yaw, topCol, glassCol, rearCol)
-            2 -> draw3DBox(canvas, cx, cy, R, x - c * 4.0f, y - s * 4.0f, bz + 4.6f, 5.6f, 7.2f, 3.2f, yaw, topCol, glassCol, glassCol)
-            else -> {
-                draw3DBox(canvas, cx, cy, R, x - c * 2.8f, y - s * 2.8f, bz + 3.2f, 4.2f, 3.4f, 2.8f, yaw, glassCol, glassCol, rearCol)
-                draw3DBox(canvas, cx, cy, R, x - c * 8.8f, y - s * 8.8f, bz + 3.2f, 3.4f, 0.9f, 3.1f, yaw, topCol, sideCol, rearCol)
-            }
-        }
-
-        // C) Araç Önü Silahı (POWER_FRONT_GUN): Kaputun tam ortasında, koyu metal gövdeli, sarı ve turuncu detaylı, tek namlulu ağır taret
-        if (isPlayer && activePower == POWER_FRONT_GUN) {
-            val hoodZ = bz + when (m) {
-                1 -> 3.5f
-                2 -> 4.6f
-                3 -> 3.0f
-                else -> 4.2f
-            }
-            val gx = x + c * 8.6f
-            val gy = y + s * 8.6f
-            if (dotFwd >= 0f) {
-                // Uzaktan yakına: Namlu -> Bilezik -> Ağır Taret Gövdesi
-                draw3DBox(canvas, cx, cy, R, gx + c * 5.2f, gy + s * 5.2f, hoodZ + 0.65f, 3.8f, 0.95f, 0.95f, yaw, Color.rgb(255, 205, 35), Color.rgb(85, 92, 104), Color.rgb(255, 145, 20))
-                draw3DBox(canvas, cx, cy, R, gx + c * 2.4f, gy + s * 2.4f, hoodZ + 0.4f, 1.3f, 1.75f, 1.35f, yaw, Color.rgb(255, 140, 20), Color.rgb(210, 100, 15), Color.rgb(255, 200, 45))
-                draw3DBox(canvas, cx, cy, R, gx - c * 0.3f, gy - s * 0.3f, hoodZ, 2.8f, 3.1f, 1.9f, yaw, Color.rgb(52, 58, 68), Color.rgb(34, 38, 46), Color.rgb(255, 175, 25))
-            } else {
-                draw3DBox(canvas, cx, cy, R, gx - c * 0.3f, gy - s * 0.3f, hoodZ, 2.8f, 3.1f, 1.9f, yaw, Color.rgb(52, 58, 68), Color.rgb(34, 38, 46), Color.rgb(255, 175, 25))
-                draw3DBox(canvas, cx, cy, R, gx + c * 2.4f, gy + s * 2.4f, hoodZ + 0.4f, 1.3f, 1.75f, 1.35f, yaw, Color.rgb(255, 140, 20), Color.rgb(210, 100, 15), Color.rgb(255, 200, 45))
-                draw3DBox(canvas, cx, cy, R, gx + c * 5.2f, gy + s * 5.2f, hoodZ + 0.65f, 3.8f, 0.95f, 0.95f, yaw, Color.rgb(255, 205, 35), Color.rgb(85, 92, 104), Color.rgb(255, 145, 20))
-            }
-        }
-
-        // A) Füze (POWER_MISSILE): Tavanın üzerinde kırmızı-beyaz gövdeli, kanatçıklı ve turuncu ateşleyici detaylı tek 3B roket modeli
-        if (isPlayer && activePower == POWER_MISSILE) {
-            val roofZ = bz + when (m) {
-                1 -> 6.3f
-                2 -> 7.8f
-                3 -> 6.0f
-                else -> 7.6f
-            }
-            val mx = x - c * 2.8f
-            val my = y - s * 2.8f
-            draw3DBox(canvas, cx, cy, R, mx, my, roofZ, 3.5f, 2.1f, 0.45f, yaw, Color.rgb(60, 65, 75), Color.rgb(40, 45, 55), Color.rgb(40, 45, 55))
-            val mz = roofZ + 0.45f
-            if (dotFwd >= 0f) {
-                // Uzaktan yakına: Kırmızı Burun -> Beyaz-Kırmızı Gövde -> Kanatçıklar ve Turuncu Ateşleyici
-                draw3DBox(canvas, cx, cy, R, mx + c * 6.0f, my + s * 6.0f, mz + 0.2f, 2.2f, 1.05f, 1.2f, yaw, Color.rgb(235, 35, 35), Color.rgb(200, 25, 25), Color.rgb(235, 35, 35))
-                draw3DBox(canvas, cx, cy, R, mx, my, mz, 5.2f, 1.5f, 1.65f, yaw, Color.rgb(245, 245, 250), Color.rgb(220, 40, 40), Color.rgb(255, 165, 20))
-                draw3DBox(canvas, cx, cy, R, mx - c * 4.2f, my - s * 4.2f, mz + 0.3f, 1.4f, 3.6f, 0.65f, yaw, Color.rgb(235, 35, 35), Color.rgb(190, 25, 25), Color.rgb(255, 195, 35))
-            } else {
-                draw3DBox(canvas, cx, cy, R, mx - c * 4.2f, my - s * 4.2f, mz + 0.3f, 1.4f, 3.6f, 0.65f, yaw, Color.rgb(235, 35, 35), Color.rgb(190, 25, 25), Color.rgb(255, 195, 35))
-                draw3DBox(canvas, cx, cy, R, mx, my, mz, 5.2f, 1.5f, 1.65f, yaw, Color.rgb(245, 245, 250), Color.rgb(220, 40, 40), Color.rgb(255, 165, 20))
-                draw3DBox(canvas, cx, cy, R, mx + c * 6.0f, my + s * 6.0f, mz + 0.2f, 2.2f, 1.05f, 1.2f, yaw, Color.rgb(235, 35, 35), Color.rgb(200, 25, 25), Color.rgb(235, 35, 35))
-            }
-        }
-
-        // 5. Arka Stop Lambaları (Uzaktan yakına sıralı)
+        // Arka Stop Lambaları
         if (!isGhost) {
             val tailX = x - c * 15.5f
             val tailY = y - s * 15.5f
             val tailCol = if (isPlayer && isFullStopped) Color.rgb(255, 220, 40) else Color.rgb(255, 30, 30)
-            draw3DBox(canvas, cx, cy, R, tailX + rxVec * (5.2f * farSide), tailY + ryVec * (5.2f * farSide), bz + 2.0f, 0.8f, 2.0f, 1.1f, yaw, tailCol, tailCol, tailCol)
-            draw3DBox(canvas, cx, cy, R, tailX + rxVec * (5.2f * nearSide), tailY + ryVec * (5.2f * nearSide), bz + 2.0f, 0.8f, 2.0f, 1.1f, yaw, tailCol, tailCol, tailCol)
+            draw3DBox(canvas, cx, cy, R, tailX - rxVec * 5.2f, tailY - ryVec * 5.2f, bz + 2.0f, 0.8f, 2.0f, 1.1f, yaw, tailCol, tailCol, tailCol)
+            draw3DBox(canvas, cx, cy, R, tailX + rxVec * 5.2f, tailY + ryVec * 5.2f, bz + 2.0f, 0.8f, 2.0f, 1.1f, yaw, tailCol, tailCol, tailCol)
         }
 
-        // B) Diken (POWER_SPIKE): Arka tamponun arkasında üçlü diken bırakma mekanizması (Önde hiçbir çıkıntı yoktur)
-        if (isPlayer && activePower == POWER_SPIKE) {
-            val sx = x - c * 17.2f
-            val sy = y - s * 17.2f
-            val sz = bz + 0.8f
-            draw3DBox(canvas, cx, cy, R, sx, sy, sz, 1.5f, 7.8f, 1.3f, yaw, Color.rgb(65, 70, 78), Color.rgb(42, 46, 54), Color.rgb(255, 140, 20))
-            // Üçlü kırmızı-metalik dikenleri kameraya uzaktan yakına doğru çiz
-            val off1 = farSide * 4.8f
-            val off2 = 0f
-            val off3 = nearSide * 4.8f
-            draw3DBox(canvas, cx, cy, R, sx + rxVec * off1, sy + ryVec * off1, sz + 1.3f, 1.0f, 1.0f, 2.5f, yaw, Color.rgb(255, 50, 50), chromeCol, Color.rgb(200, 25, 25))
-            draw3DBox(canvas, cx, cy, R, sx + rxVec * off2, sy + ryVec * off2, sz + 1.3f, 1.0f, 1.0f, 2.5f, yaw, Color.rgb(255, 50, 50), chromeCol, Color.rgb(200, 25, 25))
-            draw3DBox(canvas, cx, cy, R, sx + rxVec * off3, sy + ryVec * off3, sz + 1.3f, 1.0f, 1.0f, 2.5f, yaw, Color.rgb(255, 50, 50), chromeCol, Color.rgb(200, 25, 25))
-        }
-
-        // 6. Spoiler (En arkada ve üstte yer aldığı için en son çizilir)
-        if (!(isPlayer && spoilerBroken)) {
-            when (m) {
-                0 -> draw3DBox(canvas, cx, cy, R, x - c * 14.0f, y - s * 14.0f, bz + 5.8f, 2.0f, 9.4f, 1.0f, yaw, wheelCol, sideCol, rearCol)
-                1 -> draw3DBox(canvas, cx, cy, R, x - c * 14.8f, y - s * 14.8f, bz + 4.8f, 2.2f, 10.2f, 0.9f, yaw, rearCol, sideCol, wheelCol)
-                2 -> draw3DBox(canvas, cx, cy, R, x - c * 15.0f, y - s * 15.0f, bz + 5.0f, 1.6f, 8.8f, 1.4f, yaw, rearCol, sideCol, rearCol)
-                else -> draw3DBox(canvas, cx, cy, R, x - c * 14.2f, y - s * 14.2f, bz + 5.2f, 2.4f, 9.8f, 1.2f, yaw, chromeCol, topCol, rearCol)
-            }
-        }
-
-        // D) Kalkan (POWER_SHIELD): Aracın etrafını çevreleyen ve hareketleriyle birlikte dönen 3B mavi enerji kalkanı halkası
-        if (isPlayer && (activePower == POWER_SHIELD || respawnShieldTimer > 0f)) {
-            shieldOuterPath.reset()
-            shieldInnerPath.reset()
-            var outerValid = true
-            var innerValid = true
-            val segs = 20
-            for (i in 0 until segs) {
-                val ang = (i.toFloat() / segs) * (2f * PI.toFloat())
-                val lx = cos(ang) * 21.0f
-                val ly = sin(ang) * 14.5f
-                val wx = x + c * lx + rxVec * ly
-                val wy = y + s * lx + ryVec * ly
-                if (project3D(wx, wy, bz + 2.0f, cx, cy, R)) {
-                    if (i == 0) shieldOuterPath.moveTo(projX, projY) else shieldOuterPath.lineTo(projX, projY)
-                } else {
-                    outerValid = false
+        // 3.3 Her Özelliğe Özel 3B Silah/Ekipman Görünümü:
+        if (isPlayer) {
+            when (activePower) {
+                POWER_MISSILE -> {
+                    val mx = x - c * 1.5f; val my = y - s * 1.5f; val mz = bz + 8.2f
+                    draw3DBox(canvas, cx, cy, R, mx + c * 6.0f, my + s * 6.0f, mz + 0.2f, 2.2f, 1.1f, 1.2f, yaw, Color.rgb(235, 35, 35), Color.rgb(200, 25, 25), Color.rgb(235, 35, 35))
+                    draw3DBox(canvas, cx, cy, R, mx, my, mz, 6.5f, 1.5f, 1.7f, yaw, Color.rgb(245, 245, 250), Color.rgb(220, 40, 40), Color.rgb(255, 165, 20))
+                    draw3DBox(canvas, cx, cy, R, mx - c * 5.0f, my - s * 5.0f, mz + 0.3f, 1.5f, 3.5f, 0.6f, yaw, Color.rgb(235, 35, 35), Color.rgb(190, 25, 25), Color.rgb(255, 190, 30))
                 }
-                if (project3D(wx, wy, bz + 3.8f, cx, cy, R)) {
-                    if (i == 0) shieldInnerPath.moveTo(projX, projY) else shieldInnerPath.lineTo(projX, projY)
-                } else {
-                    innerValid = false
+                POWER_SPIKE -> {
+                    val sx = x - c * 16.8f; val sy = y - s * 16.8f; val sz = bz + 1.2f
+                    draw3DBox(canvas, cx, cy, R, sx, sy, sz, 1.6f, 7.6f, 1.4f, yaw, Color.rgb(60, 65, 72), Color.rgb(40, 44, 50), Color.rgb(255, 140, 20))
+                    for (k in -1..1) {
+                        val off = k * 4.8f
+                        draw3DBox(canvas, cx, cy, R, sx + rxVec * off, sy + ryVec * off, sz + 1.4f, 1.0f, 1.0f, 2.4f, yaw, Color.rgb(255, 55, 55), chromeCol, Color.rgb(200, 30, 30))
+                    }
+                }
+                POWER_FRONT_GUN -> {
+                    val gx = x + c * 6.5f; val gy = y + s * 6.5f; val gz = bz + 4.4f
+                    draw3DBox(canvas, cx, cy, R, gx + c * 5.5f, gy + s * 5.5f, gz + 0.6f, 4.5f, 1.1f, 1.1f, yaw, Color.rgb(255, 185, 25), Color.rgb(80, 85, 95), Color.rgb(255, 220, 60))
+                    draw3DBox(canvas, cx, cy, R, gx, gy, gz, 3.2f, 3.0f, 1.8f, yaw, Color.rgb(55, 60, 68), Color.rgb(35, 38, 44), Color.rgb(25, 28, 32))
                 }
             }
-            paint.style = Paint.Style.STROKE
-            if (outerValid) {
-                shieldOuterPath.close()
-                paint.strokeWidth = 3.2f
-                paint.color = Color.argb(220, 0, 215, 255)
-                canvas.drawPath(shieldOuterPath, paint)
-            }
-            if (innerValid) {
-                shieldInnerPath.close()
-                paint.strokeWidth = 2.0f
-                paint.color = Color.argb(175, 115, 245, 255)
-                canvas.drawPath(shieldInnerPath, paint)
+
+            if (activePower == POWER_SHIELD || respawnShieldTimer > 0f) {
+                if (project3D(x, y, bz + 4f, cx, cy, R)) {
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = 3.2f
+                    paint.color = if (activePower == POWER_SHIELD) Color.argb(210, 0, 235, 255) else Color.argb(190, 90, 255, 140)
+                    canvas.drawCircle(projX, projY, (22f * projScale).coerceAtLeast(12f), paint)
+                }
             }
         }
     }
@@ -2500,19 +2334,15 @@ class CrownDriftView(context: Context) : View(context) {
             }
         }
 
-        // Yola Bırakılan 3B Kırmızı-Metalik Dikenli Şeritler
-        val eyeX = carX - cos(camYaw) * 98f
-        val eyeY = carY - sin(camYaw) * 98f
+        // Yola Bırakılan Dikenler
         for (sp in roadSpikes) {
             if (!sp.active) continue
-            draw3DBox(canvas, cx, cy, R, sp.x, sp.y, 0.3f, 3.2f, 10.5f, 1.2f, sp.yaw, Color.rgb(55, 60, 68), Color.rgb(35, 38, 45), Color.rgb(255, 140, 20))
+            draw3DBox(canvas, cx, cy, R, sp.x, sp.y, 0.3f, 3.2f, 10.5f, 1.2f, sp.yaw, Color.rgb(55, 60, 68), Color.rgb(35, 38, 45), Color.DKGRAY)
             val rxV = -sin(sp.yaw); val ryV = cos(sp.yaw)
-            val dotR = (sp.x - eyeX) * rxV + (sp.y - eyeY) * ryV
-            val farS = if (dotR >= 0f) 1f else -1f
-            val nearS = -farS
-            draw3DBox(canvas, cx, cy, R, sp.x + rxV * (6.2f * farS), sp.y + ryV * (6.2f * farS), 1.5f, 1.4f, 1.4f, 3.0f, sp.yaw, Color.rgb(255, 50, 50), Color.rgb(220, 225, 235), Color.rgb(190, 25, 25))
-            draw3DBox(canvas, cx, cy, R, sp.x, sp.y, 1.5f, 1.4f, 1.4f, 3.0f, sp.yaw, Color.rgb(255, 50, 50), Color.rgb(220, 225, 235), Color.rgb(190, 25, 25))
-            draw3DBox(canvas, cx, cy, R, sp.x + rxV * (6.2f * nearS), sp.y + ryV * (6.2f * nearS), 1.5f, 1.4f, 1.4f, 3.0f, sp.yaw, Color.rgb(255, 50, 50), Color.rgb(220, 225, 235), Color.rgb(190, 25, 25))
+            for (k in -1..1) {
+                val off = k * 6.2f
+                draw3DBox(canvas, cx, cy, R, sp.x + rxV * off, sp.y + ryV * off, 1.5f, 1.4f, 1.4f, 3.0f, sp.yaw, Color.rgb(255, 50, 50), Color.rgb(220, 225, 235), Color.rgb(190, 25, 25))
+            }
         }
 
         // Sürpriz Kutuları
@@ -2550,16 +2380,15 @@ class CrownDriftView(context: Context) : View(context) {
             }
         }
 
-        // Aktif Füzeler ve Mermiler (Tavan roketiyle uyumlu 3B model)
+        // Aktif Füzeler ve Mermiler
         for (pr in projectiles) {
             if (!pr.active) continue
             if (pr.isMissile) {
                 val c = cos(pr.yaw); val s = sin(pr.yaw)
-                draw3DBox(canvas, cx, cy, R, pr.x + c * 6.0f, pr.y + s * 6.0f, pr.z + 0.2f, 2.2f, 1.05f, 1.2f, pr.yaw, Color.rgb(235, 35, 35), Color.rgb(200, 25, 25), Color.rgb(235, 35, 35))
-                draw3DBox(canvas, cx, cy, R, pr.x, pr.y, pr.z, 5.2f, 1.5f, 1.65f, pr.yaw, Color.rgb(245, 245, 250), Color.rgb(220, 40, 40), Color.rgb(255, 165, 20))
-                draw3DBox(canvas, cx, cy, R, pr.x - c * 4.2f, pr.y - s * 4.2f, pr.z + 0.3f, 1.4f, 3.6f, 0.65f, pr.yaw, Color.rgb(235, 35, 35), Color.rgb(190, 25, 25), Color.rgb(255, 195, 35))
+                draw3DBox(canvas, cx, cy, R, pr.x + c * 5.0f, pr.y + s * 5.0f, pr.z, 2.2f, 1.2f, 1.4f, pr.yaw, Color.rgb(235, 35, 35), Color.rgb(200, 25, 25), Color.rgb(235, 35, 35))
+                draw3DBox(canvas, cx, cy, R, pr.x, pr.y, pr.z, 6.5f, 1.6f, 1.8f, pr.yaw, Color.WHITE, Color.rgb(235, 45, 45), Color.rgb(255, 180, 25))
             } else {
-                draw3DBox(canvas, cx, cy, R, pr.x, pr.y, pr.z, 4.8f, 1.3f, 1.3f, pr.yaw, Color.rgb(255, 235, 60), Color.rgb(255, 180, 20), Color.rgb(255, 140, 20))
+                draw3DBox(canvas, cx, cy, R, pr.x, pr.y, pr.z, 4.8f, 1.3f, 1.3f, pr.yaw, Color.rgb(255, 235, 60), Color.rgb(255, 180, 20), Color.WHITE)
             }
         }
 
